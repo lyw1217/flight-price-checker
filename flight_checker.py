@@ -18,6 +18,7 @@ import time
 import logging
 import asyncio
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
@@ -47,6 +48,7 @@ SETTING = 1
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SELENIUM_HUB_URL = os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub")
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+KST = ZoneInfo("Asia/Seoul")
 
 # 유틸: URL 및 가격 파싱 로직 분리
 def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
@@ -69,7 +71,7 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
 
     try:
         driver.get(link)
-        WebDriverWait(driver, 20).until(
+        WebDriverWait(driver, 40).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="inlineFilter_FilterWrapper__"]'))
         )
         time.sleep(5)
@@ -101,6 +103,8 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
                         f"귀국: {m_ret.group(1)} → {m_ret.group(2)}\n"
                         f"왕복 가격: {price:,}원"
                     )
+    except Exception as e:
+        logger.exception(f"fetch_prices 오류: {e}")
     finally:
         driver.quit()
 
@@ -164,7 +168,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         json.dump({"restricted": restricted or 0, "overall": overall or 0}, f)
     # 저장
     ctx.chat_data['settings'] = (depart, arrive, d_date, r_date)
-    ctx.chat_data['start_time'] = datetime.now()
+    ctx.chat_data['start_time'] = datetime.now(KST)
+    ctx.chat_data['last_fetch'] = datetime.now(KST)
     ctx.chat_data['task'] = asyncio.create_task(monitor_loop(ctx, user_id, hist_file))
     # 초기 안내 메시지
     await update.message.reply_text(
@@ -188,12 +193,14 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = json.load(open(hist_file)) if os.path.exists(hist_file) else {}
     restricted = data.get("restricted")
     overall = data.get("overall")
-    elapsed = (datetime.now() - ctx.chat_data['start_time']).days
+    elapsed = (datetime.now(KST) - ctx.chat_data['start_time']).days
+    lf = ctx.chat_data.get('last_fetch')
     await update.message.reply_text(
         f"📋 현재 설정:\n"
-        f"{depart}→{arrive} {d_date}~{r_date}\n"
+        f"{depart}↔️{arrive} {d_date}~{r_date}\n"
         f"조건 최저가: {restricted or '없음':,}원\n"
         f"전체 최저가: {overall or '없음':,}원\n"
+        f"마지막 조회: {lf.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"경과일: {elapsed}일 (최대 30일)"
     )
 
@@ -222,7 +229,7 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hist_file=f"price_{chat_id}_{depart}_{arrive}_{d_date}_{r_date}.json"
         hist=json.load(open(hist_file)) if os.path.exists(hist_file) else {}
         restricted=hist.get("restricted"); overall=hist.get("overall")
-        elapsed=(datetime.now()-data.get('start_time')).days
+        elapsed=(datetime.now(KST)-data.get('start_time')).days
         lines.append(f"{chat_id}: {depart}->{arrive} {d_date}~{r_date} | 제한:{restricted}원 | 전체:{overall}원 | {elapsed}일")
     await update.message.reply_text("\n".join(lines) or "현재 등록된 모니터링이 없습니다.")
 
@@ -242,37 +249,46 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, hist_file: str):
     settings = ctx.chat_data['settings']
     while True:
-        depart, arrive, d_date, r_date = settings
-        # 이력 로드
-        data=json.load(open(hist_file)) if os.path.exists(hist_file) else {"restricted":0,"overall":0}
-        old_restr, old_overall = data.get("restricted"), data.get("overall")
-        # 최신 가격 조회
-        restricted, r_info, overall, o_info, link = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_prices, depart, arrive, d_date, r_date
-        )
-        # 하락 감지
-        notify=False
-        if restricted and restricted < old_restr:
-            notify=True
-        if overall and overall < old_overall:
-            notify=True
-        if notify:
-            msg=(
-                f"📉 {depart}->{arrive} {d_date}~{r_date} 가격 하락!\n"
-                f"[조건] {restricted or '없음'}원\n{r_info}\n"
-                f"[전체] {overall or '없음'}원\n{o_info}\n"
-                f"🔗 {link}"
+        try:
+            depart, arrive, d_date, r_date = settings
+            # 이력 로드
+            data=json.load(open(hist_file)) if os.path.exists(hist_file) else {"restricted":0,"overall":0}
+            old_restr, old_overall = data.get("restricted"), data.get("overall")
+            # 최신 가격 조회
+            restricted, r_info, overall, o_info, link = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_prices, depart, arrive, d_date, r_date
             )
-            await ctx.bot.send_message(user_id, msg)
-            # 이력 업데이트
-            data["restricted"]=restricted or old_restr
-            data["overall"]=overall or old_overall
-            with open(hist_file,"w") as f: json.dump(data,f)
-        # 주기 보고
-        #report=(
-        #    f"🔍 조건: {restricted or '없음'}원 | 전체: {overall or '없음'}원"
-        #)
-        await ctx.bot.send_message(user_id, report)
+            # 하락 감지
+            notify=False
+            if restricted and restricted < old_restr:
+                notify=True
+            if overall and overall < old_overall:
+                notify=True
+            if notify:
+                msg=(
+                    f"📉 {depart}->{arrive} {d_date}~{r_date} 가격 하락!\n"
+                    f"[조건] {restricted or '없음'}원\n{r_info}\n"
+                    f"[전체] {overall or '없음'}원\n{o_info}\n"
+                    f"🔗 {link}"
+                )
+                await ctx.bot.send_message(user_id, msg)
+                # 이력 업데이트
+                data["restricted"]=restricted or old_restr
+                data["overall"]=overall or old_overall
+                data['last_fetch'] = datetime.now(KST)
+                with open(hist_file,"w") as f: json.dump(data,f)
+
+        except Exception as e:
+            # 사용자에게도 알림
+            logger.exception(f"[{user_id}] monitor_loop 중 예외 발생\n{e}")
+            await ctx.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ 모니터링 중 오류가 발생했습니다:\n5분 후 재시도합니다."
+            )
+            # 짧게 대기 후 재시도
+            await asyncio.sleep(5 * 60)
+            continue
+
         await asyncio.sleep(30*60)
 
 # --- 메인 함수 ---
