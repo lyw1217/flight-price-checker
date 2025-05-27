@@ -107,15 +107,17 @@ def get_time_range(config: dict, direction: str) -> tuple[time, time]:
     if config['time_type'] == 'time_period':
         periods = config[f'{direction}_periods']
         period_ranges = [TIME_PERIODS[p] for p in periods]
+        start_hours = [start for start, _ in period_ranges]
+        end_hours = [end for _, end in period_ranges]
+        
         if direction == 'outbound':
             # 가는 편: 선택한 시간대에 포함되는 항공편만
-            start_hours = [start for start, _ in period_ranges]
-            end_hours = [end for _, end in period_ranges]
             return time(hour=min(start_hours), minute=0), time(hour=max(end_hours), minute=0)
         else:
             # 오는 편: 선택한 시간대에 포함되는 항공편만
-            start_hours = [start for start, _ in period_ranges]
-            end_hours = [end for _, end in period_ranges]
+            # 시간대가 연속되지 않을 경우를 위해 전체 범위로 설정
+            # 예: 오전1(06-09)과 오후2(15-18)를 선택한 경우
+            # 06:00-18:00 사이의 모든 항공편을 포함
             return time(hour=min(start_hours), minute=0), time(hour=max(end_hours), minute=0)
     else:  # exact
         hour = config[f'{direction}_exact_hour']
@@ -131,10 +133,16 @@ def format_time_range(config: dict, direction: str) -> str:
     if config['time_type'] == 'time_period':
         periods = config[f'{direction}_periods']
         period_ranges = [TIME_PERIODS[p] for p in periods]
-        start_hour = min(start for start, _ in period_ranges)
-        end_hour = max(end for _, end in period_ranges)
+        start_hours = [start for start, _ in period_ranges]
+        end_hours = [end for _, end in period_ranges]
         period_str = ", ".join(periods)
-        return f"{period_str} ({start_hour:02d}:00-{end_hour:02d}:00)"
+        
+        if direction == 'outbound':
+            return f"{period_str} ({min(start_hours):02d}:00-{max(end_hours):02d}:00)"
+        else:
+            # 오는 편은 선택한 시간대들을 모두 표시
+            time_ranges = [f"{start:02d}:00-{end:02d}:00" for start, end in period_ranges]
+            return f"{period_str} ({' / '.join(time_ranges)})"
     else:  # exact
         hour = config[f'{direction}_exact_hour']
         return f"{hour:02d}:00 {'이전' if direction == 'outbound' else '이후'}"
@@ -301,12 +309,12 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
     # 사용자 설정 가져오기
     if user_id:
         config = get_user_config(user_id)
-        outbound_before, _ = get_time_range(config, 'outbound')
-        _, inbound_after = get_time_range(config, 'inbound')
+        outbound_start, outbound_end = get_time_range(config, 'outbound')
+        inbound_start, inbound_end = get_time_range(config, 'inbound')
     else:
         # 기본값 사용
-        outbound_before, _ = get_time_range(DEFAULT_USER_CONFIG, 'outbound')
-        _, inbound_after = get_time_range(DEFAULT_USER_CONFIG, 'inbound')
+        outbound_start, outbound_end = get_time_range(DEFAULT_USER_CONFIG, 'outbound')
+        inbound_start, inbound_end = get_time_range(DEFAULT_USER_CONFIG, 'inbound')
     
     for attempt in range(max_retries):
         try:
@@ -364,9 +372,17 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                     dep_t = datetime.strptime(m_dep.group(1), "%H:%M").time()
                     ret_t = datetime.strptime(m_ret.group(1), "%H:%M").time()
                     
-                    # 가는 편: outbound_before "이전"
-                    # 오는 편: inbound_after "이후"
-                    if dep_t <= outbound_before and ret_t >= inbound_after:
+                    # 시간대 또는 시각 제한 체크
+                    if config['time_type'] == 'time_period':
+                        # 시간대 설정: 범위 내에 있는지 확인
+                        is_valid_outbound = outbound_start <= dep_t <= outbound_end
+                        is_valid_inbound = inbound_start <= ret_t <= inbound_end
+                    else:
+                        # 시각 설정: 이전/이후 확인
+                        is_valid_outbound = dep_t <= outbound_end  # 이전
+                        is_valid_inbound = ret_t >= inbound_start  # 이후
+                    
+                    if is_valid_outbound and is_valid_inbound:
                         if restricted_price is None or price < restricted_price:
                             restricted_price = price
                             restricted_info = (
@@ -1238,11 +1254,14 @@ async def on_startup(app):
     now = datetime.now(KST)
     monitors = app.bot_data.setdefault("monitors", {})
     logger.info("봇 시작 시 on_startup 실행")
+    
+    # 모든 모니터링 작업 즉시 실행
     for hist_path in DATA_DIR.glob("price_*.json"):
         try:
             m = PATTERN.fullmatch(hist_path.name)
             if not m:
                 continue
+                
             data = json.loads(hist_path.read_text(encoding="utf-8"))
             start_time_str = data.get("start_time")
             try:
@@ -1252,19 +1271,40 @@ async def on_startup(app):
                 ).replace(tzinfo=KST)
             except Exception:
                 start_time = now
+                
+            # 마지막 조회 시간 확인
             last_fetch_str = data.get("last_fetch")
             try:
                 last_fetch = datetime.strptime(
                     last_fetch_str,
                     "%Y-%m-%d %H:%M:%S"
                 ).replace(tzinfo=KST)
-                delta = now - last_fetch
             except Exception:
-                delta = timedelta(minutes=999)
+                last_fetch = start_time
+                
+            # 30분 이상 지났거나 마지막 조회 시간이 없는 경우 즉시 실행
             interval = timedelta(minutes=30)
+            delta = now - last_fetch
             first_delay = timedelta(seconds=0) if delta >= interval else interval - delta
+            
             uid = int(m.group("uid"))
             dep, arr, dd, rd = m.group("dep"), m.group("arr"), m.group("dd"), m.group("rd")
+            
+            # 즉시 실행이 필요한 경우 별도의 일회성 작업 추가
+            if first_delay == timedelta(seconds=0):
+                logger.info(f"즉시 조회 예약: {hist_path.name} (마지막 조회: {last_fetch_str})")
+                app.job_queue.run_once(
+                    monitor_job,
+                    when=0,
+                    name=f"{hist_path}_immediate",
+                    data={
+                        "chat_id": uid,
+                        "settings": (dep, arr, dd, rd),
+                        "hist_path": str(hist_path)
+                    }
+                )
+            
+            # 정기 모니터링 작업 등록
             job = app.job_queue.run_repeating(
                 monitor_job,
                 interval=interval,
@@ -1276,13 +1316,14 @@ async def on_startup(app):
                     "hist_path": str(hist_path)
                 }
             )
+            
             monitors.setdefault(uid, []).append({
                 "settings": (dep, arr, dd, rd),
                 "start_time": start_time,
                 "hist_path": str(hist_path),
                 "job": job
             })
-            logger.info(f"복원된 모니터링: {hist_path.name}")
+            logger.info(f"복원된 모니터링: {hist_path.name} (다음 실행: {first_delay.total_seconds():.1f}초 후)")
         except Exception as ex:
             logger.error(f"모니터링 복원 중 오류 발생 ({hist_path.name}): {ex}")
             try:
