@@ -131,7 +131,8 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
     except Exception as ex:
         logger.exception(f"fetch_prices 오류: {ex}")
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
     return restricted_price, restricted_info, overall_price, overall_info, url
 
@@ -235,33 +236,39 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
+    chat_id = data['chat_id']
     depart, arrive, d_date, r_date = data['settings']
     hist_path = Path(data['hist_path'])
-    logger.info(f"monitor_job 실행: {depart}->{arrive} 저장소 {hist_path.name}")
+    logger.info(f"monitor_job 실행: {depart}->{arrive}, 히스토리 파일: {hist_path.name}")
 
     state = json.loads(hist_path.read_text(encoding='utf-8'))
     old_restr = state.get("restricted", 0)
     old_overall = state.get("overall", 0)
+
     loop = asyncio.get_running_loop()
     restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, depart, arrive, d_date, r_date)
 
     notify = False
+    parts = []
     if restricted and restricted < old_restr:
         notify = True
-        logger.info(f"가격 하락 감지: 조건최저가 {old_restr}→{restricted}")
+        parts.append(f"[조건 최저가] {old_restr:,}원 → {restricted:,}원")
+        parts.append(r_info)
+        logger.info(f"조건 최저가 하락: {old_restr} → {restricted}")
     if overall and overall < old_overall:
         notify = True
-        logger.info(f"가격 하락 감지: 전체최저가 {old_overall}→{overall}")
+        parts.append(f"[전체 최저가] {old_overall:,}원 → {overall:,}원")
+        parts.append(o_info)
+        logger.info(f"전체 최저가 하락: {old_overall} → {overall}")
 
     if notify:
         msg = (
             f"📉 {depart}->{arrive} {d_date}~{r_date} 가격 하락!\n"
-            f"[조건] {restricted or '없음'}원\n{r_info}\n"
-            f"[전체] {overall or '없음'}원\n{o_info}\n"
-            f"🔗 {link}"
+            + "\n".join(parts)
+            + f"\n🔗 {link}"
         )
-        await context.bot.send_message(data['chat_id'], msg)
-        logger.info("알림 전송 완료")
+        await context.bot.send_message(chat_id, msg)
+        logger.info("가격 하락 알림 전송 완료")
 
     new_state = {
         "start_time": state.get("start_time"),
@@ -316,11 +323,15 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         p for p in DATA_DIR.iterdir()
         if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
     ])
+    monitors = ctx.application.bot_data.get("monitors", {})
+    user_mons = monitors.get(user_id, [])
+
     if key == 'all':
         for hist in files:
             hist.unlink()
             for job in ctx.application.job_queue.get_jobs_by_name(str(hist)):
                 job.schedule_removal()
+        monitors.pop(user_id, None)
         await update.message.reply_text("✅ 전체 모니터링을 취소했습니다.")
         logger.info(f"사용자 {user_id} 전체 모니터링 취소")
         return
@@ -335,6 +346,11 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target.unlink()
         for job in ctx.application.job_queue.get_jobs_by_name(str(target)):
             job.schedule_removal()
+
+        if user_id in monitors:
+            monitors[user_id] = [m for m in user_mons if m.get('hist_path') != str(target)]
+            if not monitors[user_id]:
+                monitors.pop(user_id)
         await update.message.reply_text(f"✅ {key}번 모니터링을 취소했습니다.")
         logger.info(f"사용자 {user_id} {key}번 모니터링 취소")
         return
@@ -393,14 +409,16 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     count = 0
     for uid, mons in list(monitors.items()):
         for mon in mons:
+            hist = Path(mon.get("hist_path", ""))
+            if hist.exists():
+                hist.unlink()
             job = mon.get("job")
             if job:
                 job.schedule_removal()
                 count += 1
-            hist = Path(mon.get("hist_path", ""))
-            if hist.exists():
-                hist.unlink()
+
         monitors.pop(uid, None)
+
     await update.message.reply_text(f"✅ 전체 모니터링 종료: {count}건")
     logger.info(f"전체 모니터링 종료: {count}건")
 
