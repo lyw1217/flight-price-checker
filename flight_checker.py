@@ -50,6 +50,10 @@ SELENIUM_HUB_URL = os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub")
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
 KST = ZoneInfo("Asia/Seoul")
 
+def datetime_to_string(obj):
+    if isinstance(obj, datetime):
+        return obj.__str__()
+
 # 유틸: URL 및 가격 파싱 로직 분리
 def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
     link = (
@@ -163,7 +167,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         None, fetch_prices, depart, arrive, d_date, r_date
     )
     # 이력 파일 저장
-    hist_file = f"price_{user_id}_{depart}_{arrive}_{d_date}_{r_date}.json"
+    hist_file = os.path.join("/data",f"price_{user_id}_{depart}_{arrive}_{d_date}_{r_date}.json")
     with open(hist_file, "w") as f:
         json.dump({"restricted": restricted or 0, "overall": overall or 0}, f)
     # 저장
@@ -189,7 +193,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     depart, arrive, d_date, r_date = settings
     # 이력 로드
-    hist_file = f"price_{user_id}_{depart}_{arrive}_{d_date}_{r_date}.json"
+    hist_file = os.path.join("/data",f"price_{user_id}_{depart}_{arrive}_{d_date}_{r_date}.json")
     data = json.load(open(hist_file)) if os.path.exists(hist_file) else {}
     restricted = data.get("restricted")
     overall = data.get("overall")
@@ -226,7 +230,7 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings = data.get('settings')
         if not settings: continue
         depart, arrive, d_date, r_date = settings
-        hist_file=f"price_{chat_id}_{depart}_{arrive}_{d_date}_{r_date}.json"
+        hist_file=os.path.join("/data",f"price_{chat_id}_{depart}_{arrive}_{d_date}_{r_date}.json")
         hist=json.load(open(hist_file)) if os.path.exists(hist_file) else {}
         restricted=hist.get("restricted"); overall=hist.get("overall")
         elapsed=(datetime.now(KST)-data.get('start_time')).days
@@ -272,11 +276,12 @@ async def monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, hist_file: 
                     f"🔗 {link}"
                 )
                 await ctx.bot.send_message(user_id, msg)
-                # 이력 업데이트
-                data["restricted"]=restricted or old_restr
-                data["overall"]=overall or old_overall
-                data['last_fetch'] = datetime.now(KST)
-                with open(hist_file,"w") as f: json.dump(data,f)
+            
+            # 이력 업데이트
+            data["restricted"]=restricted or old_restr
+            data["overall"]=overall or old_overall
+            data['last_fetch'] = datetime.now(KST)
+            with open(hist_file,"w") as f: json.dump(data,f,default=datetime_to_string)
 
         except Exception as e:
             # 사용자에게도 알림
