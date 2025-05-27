@@ -41,6 +41,200 @@ LOG_DIR = DATA_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "flight_bot.log"
 
+# 사용자 설정 디렉토리
+USER_CONFIG_DIR = DATA_DIR / "user_configs"
+USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+# 시간대 설정
+TIME_PERIODS = {
+    "새벽": (0, 6),    # 00:00 ~ 06:00
+    "오전1": (6, 9),   # 06:00 ~ 09:00
+    "오전2": (9, 12),  # 09:00 ~ 12:00
+    "오후1": (12, 15), # 12:00 ~ 15:00
+    "오후2": (15, 18), # 15:00 ~ 18:00
+    "밤1": (18, 21),   # 18:00 ~ 21:00
+    "밤2": (21, 24),   # 21:00 ~ 00:00
+}
+
+# 기본 설정값
+DEFAULT_USER_CONFIG = {
+    "time_type": "time_period",        # 'time_period' 또는 'exact'
+    "outbound_periods": ["오전1", "오전2"],  # 가는 편 시간대
+    "inbound_periods": ["오후1", "오후2", "밤1"],  # 오는 편 시간대
+    "outbound_exact_hour": 9,          # 가는 편 시각 (시간 단위)
+    "inbound_exact_hour": 15,          # 오는 편 시각 (시간 단위)
+    "last_activity": None,             # 마지막 활동 시간
+    "created_at": None                 # 설정 생성 시간
+}
+
+def get_user_config(user_id: int) -> dict:
+    """사용자 설정을 가져옵니다."""
+    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
+    if config_file.exists():
+        try:
+            with file_lock(config_file):
+                data = json.loads(config_file.read_text(encoding='utf-8'))
+                # 마지막 활동 시간 업데이트
+                data['last_activity'] = format_datetime(datetime.now())
+                config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+                return data
+        except Exception as e:
+            logger.error(f"사용자 설정 로드 중 오류: {e}")
+    
+    # 설정 파일이 없으면 기본값으로 생성
+    default_config = DEFAULT_USER_CONFIG.copy()
+    default_config['created_at'] = format_datetime(datetime.now())
+    default_config['last_activity'] = format_datetime(datetime.now())
+    save_user_config(user_id, default_config)
+    return default_config
+
+def save_user_config(user_id: int, config: dict):
+    """사용자 설정을 저장합니다."""
+    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
+    with file_lock(config_file):
+        config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+
+def get_time_range(config: dict, direction: str) -> tuple[time, time]:
+    """시간 범위를 반환합니다.
+    
+    Args:
+        config: 사용자 설정
+        direction: 'outbound' 또는 'inbound'
+        
+    Returns:
+        tuple[time, time]: 시작 시각과 종료 시각
+    """
+    if config['time_type'] == 'time_period':
+        periods = config[f'{direction}_periods']
+        period_ranges = [TIME_PERIODS[p] for p in periods]
+        if direction == 'outbound':
+            # 가는 편: 선택한 시간대에 포함되는 항공편만
+            start_hours = [start for start, _ in period_ranges]
+            end_hours = [end for _, end in period_ranges]
+            return time(hour=min(start_hours), minute=0), time(hour=max(end_hours), minute=0)
+        else:
+            # 오는 편: 선택한 시간대에 포함되는 항공편만
+            start_hours = [start for start, _ in period_ranges]
+            end_hours = [end for _, end in period_ranges]
+            return time(hour=min(start_hours), minute=0), time(hour=max(end_hours), minute=0)
+    else:  # exact
+        hour = config[f'{direction}_exact_hour']
+        if direction == 'outbound':
+            # 가는 편은 "이전"이므로 정확한 시각이 끝 시각
+            return time(hour=0, minute=0), time(hour=hour, minute=0)
+        else:
+            # 오는 편은 "이후"이므로 정확한 시각이 시작 시각
+            return time(hour=hour, minute=0), time(hour=24, minute=0)
+
+def format_time_range(config: dict, direction: str) -> str:
+    """시간 설정을 문자열로 변환합니다."""
+    if config['time_type'] == 'time_period':
+        periods = config[f'{direction}_periods']
+        period_ranges = [TIME_PERIODS[p] for p in periods]
+        start_hour = min(start for start, _ in period_ranges)
+        end_hour = max(end for _, end in period_ranges)
+        period_str = ", ".join(periods)
+        return f"{period_str} ({start_hour:02d}:00-{end_hour:02d}:00)"
+    else:  # exact
+        hour = config[f'{direction}_exact_hour']
+        return f"{hour:02d}:00 {'이전' if direction == 'outbound' else '이후'}"
+
+async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """사용자 설정 확인 및 변경"""
+    user_id = update.effective_user.id
+    config = get_user_config(user_id)
+    
+    msg_lines = [
+        "⚙️ *시간 제한 설정*",
+        "",
+        "*현재 설정*",
+        f"• 가는 편: {format_time_range(config, 'outbound')}",
+        f"• 오는 편: {format_time_range(config, 'inbound')}",
+        "",
+        "*설정 방법*",
+        "1️⃣ *시간대로 설정* (해당 시간대의 항공편만 검색)",
+        "• 가는 편: `/set 가는편 시간대 오전1 오전2`",
+        "• 오는 편: `/set 오는편 시간대 오후1 오후2 밤1`",
+        "",
+        "2️⃣ *특정 시각으로 설정*",
+        "• 가는 편: `/set 가는편 시각 9` (09:00 이전 출발)",
+        "• 오는 편: `/set 오는편 시각 15` (15:00 이후 출발)",
+        "",
+        "*시간대 구분*",
+        "• 새벽 (00-06), 오전1 (06-09)",
+        "• 오전2 (09-12), 오후1 (12-15)",
+        "• 오후2 (15-18), 밤1 (18-21)",
+        "• 밤2 (21-24)"
+    ]
+    
+    await update.message.reply_text(
+        "\n".join(msg_lines),
+        parse_mode="Markdown"
+    )
+
+async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """설정 변경"""
+    user_id = update.effective_user.id
+    args = update.message.text.strip().split()
+    
+    if len(args) < 4:
+        await update.message.reply_text(
+            "❗ 올바른 형식으로 입력해주세요.\n"
+            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+        )
+        return
+    
+    _, direction, set_type, *values = args
+    
+    if direction not in ["가는편", "오는편"]:
+        await update.message.reply_text("❗ '가는편' 또는 '오는편'만 설정 가능합니다.")
+        return
+    
+    direction = "outbound" if direction == "가는편" else "inbound"
+    config = get_user_config(user_id)
+    
+    if set_type == "시각":
+        if len(values) != 1 or not values[0].isdigit():
+            await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
+            return
+            
+        hour = int(values[0])
+        if hour < 0 or hour > 23:
+            await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
+            return
+            
+        config['time_type'] = 'exact'
+        config[f'{direction}_exact_hour'] = hour
+        
+    elif set_type == "시간대":
+        if not values:
+            await update.message.reply_text("❗ 하나 이상의 시간대를 선택해주세요.")
+            return
+            
+        invalid_periods = [p for p in values if p not in TIME_PERIODS]
+        if invalid_periods:
+            await update.message.reply_text(
+                f"❗ 올바르지 않은 시간대: {', '.join(invalid_periods)}\n"
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            )
+            return
+            
+        config['time_type'] = 'time_period'
+        config[f'{direction}_periods'] = values
+        
+    else:
+        await update.message.reply_text(
+            "❗ '시각' 또는 '시간대'로만 설정 가능합니다.\n"
+            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+        )
+        return
+    
+    save_user_config(user_id, config)
+    await update.message.reply_text(
+        f"✅ {direction=='outbound'and'가는 편'or'오는 편'} 설정이 변경되었습니다:\n"
+        f"{format_time_range(config, direction)}"
+    )
+
 # 로그 파일 크기 제한 (10MB)
 MAX_LOG_SIZE = 10 * 1024 * 1024
 
@@ -97,12 +291,22 @@ def format_datetime(dt: datetime) -> str:
     return dt.astimezone(KST).strftime('%Y-%m-%d %H:%M:%S')
 
 # 항공권 조회 로직
-def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries=3):
+def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries=3, user_id=None):
     logger.info(f"fetch_prices 호출: {depart}->{arrive} {d_date}~{r_date}")
     url = (
         f"https://flight.naver.com/flights/international/"
         f"{depart}-{arrive}-{d_date}/{arrive}-{depart}-{r_date}?adult=1&fareType=Y"
     )
+    
+    # 사용자 설정 가져오기
+    if user_id:
+        config = get_user_config(user_id)
+        outbound_before, _ = get_time_range(config, 'outbound')
+        _, inbound_after = get_time_range(config, 'inbound')
+    else:
+        # 기본값 사용
+        outbound_before, _ = get_time_range(DEFAULT_USER_CONFIG, 'outbound')
+        _, inbound_after = get_time_range(DEFAULT_USER_CONFIG, 'inbound')
     
     for attempt in range(max_retries):
         try:
@@ -150,15 +354,24 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                     price = int(m_price.group(1).replace(",", ""))
                     if overall_price is None or price < overall_price:
                         overall_price = price
-                        overall_info = f"출국 {m_dep.group(1)}, 귀국 {m_ret.group(1)}, 가격 {price:,}원"
-                    dep_t = datetime.strptime(m_dep.group(1), "%H:%M")
-                    ret_t = datetime.strptime(m_ret.group(1), "%H:%M")
-                    if dep_t.hour < 12 and ret_t.hour >= 14:
+                        overall_info = (
+                            f"가는 편: {m_dep.group(1)} → {m_dep.group(2)}\n"
+                            f"오는 편: {m_ret.group(1)} → {m_ret.group(2)}\n"
+                            f"왕복 가격: {price:,}원"
+                        )
+                    
+                    # 시간 제한 적용
+                    dep_t = datetime.strptime(m_dep.group(1), "%H:%M").time()
+                    ret_t = datetime.strptime(m_ret.group(1), "%H:%M").time()
+                    
+                    # 가는 편: outbound_before "이전"
+                    # 오는 편: inbound_after "이후"
+                    if dep_t <= outbound_before and ret_t >= inbound_after:
                         if restricted_price is None or price < restricted_price:
                             restricted_price = price
                             restricted_info = (
-                                f"출국: {m_dep.group(1)} → {m_dep.group(2)}\n"
-                                f"귀국: {m_ret.group(1)} → {m_ret.group(2)}\n"
+                                f"가는 편: {m_dep.group(1)} → {m_dep.group(2)}\n"
+                                f"오는 편: {m_ret.group(1)} → {m_ret.group(2)}\n"
                                 f"왕복 가격: {price:,}원"
                             )
                 
@@ -183,26 +396,33 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
 async def help_text() -> str:
     admin_help = ""
     if ADMIN_IDS:
-        admin_help = "\n관리자 명령:\n/all_status - 전체 상태 조회\n/all_cancel - 전체 모니터링 취소"
+        admin_help = (
+            "\n\n👑 *관리자 명령어*\n"
+            "• /all_status - 전체 모니터링 현황\n"
+            "• /all_cancel - 전체 모니터링 취소"
+        )
+    
     return (
-        "✈️ 30분마다 네이버 항공권 최저가 조회\n"
-        "🛫 조건: 출발일 12시 이전, 도착일 14시 이후\n"
-        "사용법:\n"
-        "/monitor - 모니터링 시작 (예: ICN FUK 20251025 20251027)\n"
-        "/status  - 내 설정 확인\n"
-        "/cancel  - 모니터링 취소\n"
-        "/airport - 주요 공항 코드 목록\n"
-        "/help    - 도움말"
+        "✈️ *항공권 최저가 모니터링 봇*\n"
+        "\n"
+        "📝 *기본 명령어*\n"
+        "• /monitor - 새로운 모니터링 시작\n"
+        "• /status - 모니터링 현황 확인\n"
+        "• /cancel - 모니터링 취소\n"
+        "\n"
+        "⚙️ *설정 명령어*\n"
+        "• /settings - 시간 제한 설정\n"
+        "• /airport - 공항 코드 목록"
         + admin_help
     )
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /help")
-    await update.message.reply_text(await help_text())
+    await update.message.reply_text(await help_text(), parse_mode="Markdown")
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /start")
-    await update.message.reply_text(await help_text())
+    await update.message.reply_text(await help_text(), parse_mode="Markdown")
 
 # 환경변수 검증
 def validate_env_vars() -> list[str]:
@@ -280,7 +500,16 @@ def rate_limit(func):
 @rate_limit
 async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /monitor")
-    await update.message.reply_text("⚙️ 입력 예시: ICN FUK 20251025 20251027 (YYYYMMDD)")
+    msg_lines = [
+        "✈️ *항공권 모니터링 설정*",
+        "",
+        "출발공항 도착공항 가는날짜 오는날짜",
+        "예시: `ICN FUK 20251025 20251027`",
+        "",
+        "• 공항코드: 3자리 영문",
+        "• 날짜: YYYYMMDD"
+    ]
+    await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
     return SETTING
 
 # 유효 날짜 체크
@@ -522,36 +751,36 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return SETTING
 
-    depart, arrive, d_date, r_date = text
-    depart = depart.upper()
-    arrive = arrive.upper()
+    outbound_dep, outbound_arr, outbound_date, inbound_date = text
+    outbound_dep = outbound_dep.upper()
+    outbound_arr = outbound_arr.upper()
     
     # 공항 코드 기본 형식 검증
-    for code, name in [(depart, "출발"), (arrive, "도착")]:
+    for code, name in [(outbound_dep, "출발"), (outbound_arr, "도착")]:
         is_valid, msg = valid_airport(code)
         if not is_valid:
             await update.message.reply_text(f"❗ {name}공항 코드 오류: {msg}")
             return SETTING
         
-    if depart == arrive:
+    if outbound_dep == outbound_arr:
         await update.message.reply_text("❗ 출발지와 도착지가 같을 수 없습니다")
         return SETTING
     
     # 날짜 검증
-    is_valid, msg = valid_date(d_date)
+    is_valid, msg = valid_date(outbound_date)
     if not is_valid:
-        await update.message.reply_text(f"❗ 출발 날짜 오류: {msg}")
+        await update.message.reply_text(f"❗ 가는 편 날짜 오류: {msg}")
         return SETTING
         
-    is_valid, msg = valid_date(r_date)
+    is_valid, msg = valid_date(inbound_date)
     if not is_valid:
-        await update.message.reply_text(f"❗ 귀국 날짜 오류: {msg}")
+        await update.message.reply_text(f"❗ 오는 편 날짜 오류: {msg}")
         return SETTING
         
-    d_date_obj = _dt.strptime(d_date, "%Y%m%d")
-    r_date_obj = _dt.strptime(r_date, "%Y%m%d")
-    if r_date_obj <= d_date_obj:
-        await update.message.reply_text("❗ 귀국 날짜는 출발 날짜보다 뒤여야 합니다")
+    outbound_date_obj = _dt.strptime(outbound_date, "%Y%m%d")
+    inbound_date_obj = _dt.strptime(inbound_date, "%Y%m%d")
+    if inbound_date_obj <= outbound_date_obj:
+        await update.message.reply_text("❗ 오는 편 날짜는 가는 편 날짜보다 뒤여야 합니다")
         return SETTING
 
     user_id = update.effective_user.id
@@ -562,30 +791,30 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # 공항 정보 가져오기
-    _, dep_city, dep_airport = get_airport_info(depart)
-    _, arr_city, arr_airport = get_airport_info(arrive)
+    _, dep_city, dep_airport = get_airport_info(outbound_dep)
+    _, arr_city, arr_airport = get_airport_info(outbound_arr)
     
     # 데이터베이스에 없는 공항의 경우 기본값 설정
     if not dep_city:
-        dep_city = depart
-        dep_airport = f"{depart}공항"
+        dep_city = outbound_dep
+        dep_airport = f"{outbound_dep}공항"
     if not arr_city:
-        arr_city = arrive
-        arr_airport = f"{arrive}공항"
+        arr_city = outbound_arr
+        arr_airport = f"{outbound_arr}공항"
 
-    logger.info(f"사용자 {user_id} 설정: {depart}->{arrive} {d_date}~{r_date}")
+    logger.info(f"사용자 {user_id} 설정: {outbound_dep}->{outbound_arr} {outbound_date}~{inbound_date}")
     await update.message.reply_text(
         "✅ *항공권 모니터링 시작*\n"
-        f"출발: {dep_city} ({depart})\n"
-        f"도착: {arr_city} ({arrive})\n"
-        f"일정: {d_date[:4]}/{d_date[4:6]}/{d_date[6:]} → {r_date[:4]}/{r_date[4:6]}/{r_date[6:]}\n\n"
+        f"가는 편: {dep_city} ({outbound_dep}) → {arr_city} ({outbound_arr})\n"
+        f"오는 편: {arr_city} ({outbound_arr}) → {dep_city} ({outbound_dep})\n"
+        f"일정: {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}\n\n"
         "🔍 첫 조회 중...",
         parse_mode="Markdown"
     )
 
     try:
         loop = asyncio.get_running_loop()
-        restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, depart, arrive, d_date, r_date)
+        restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, outbound_dep, outbound_arr, outbound_date, inbound_date, user_id)
         
         # 가격이 모두 None인 경우도 오류로 처리
         if restricted is None and overall is None:
@@ -606,13 +835,21 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return SETTING
 
-    hist_path = DATA_DIR / f"price_{user_id}_{depart}_{arrive}_{d_date}_{r_date}.json"
+    hist_path = DATA_DIR / f"price_{user_id}_{outbound_dep}_{outbound_arr}_{outbound_date}_{inbound_date}.json"
     start_time = format_datetime(datetime.now())
+    
+    # 사용자 설정 가져오기
+    user_config = get_user_config(user_id)
+    
     hist_path.write_text(json.dumps({
         "start_time": start_time,
         "restricted": restricted or 0,
         "overall": overall or 0,
-        "last_fetch": format_datetime(datetime.now())
+        "last_fetch": format_datetime(datetime.now()),
+        "outbound_before": format_time_range(user_config, 'outbound'),
+        "outbound_after": format_time_range(user_config, 'outbound'),
+        "inbound_before": format_time_range(user_config, 'inbound'),
+        "inbound_after": format_time_range(user_config, 'inbound')
     }), encoding="utf-8")
 
     job = ctx.application.job_queue.run_repeating(
@@ -622,34 +859,38 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name=str(hist_path),      
         data={                    
             "chat_id": user_id,
-            "settings": (depart, arrive, d_date, r_date),
+            "settings": (outbound_dep, outbound_arr, outbound_date, inbound_date),
             "hist_path": str(hist_path)
         }
     )
 
     monitors = ctx.application.bot_data.setdefault("monitors", {})
     monitors.setdefault(user_id, []).append({
-        "settings":   (depart, arrive, d_date, r_date),
+        "settings": (outbound_dep, outbound_arr, outbound_date, inbound_date),
         "start_time": datetime.now(KST),
-        "hist_path":  str(hist_path),
-        "job":        job
+        "hist_path": str(hist_path),
+        "job": job
     })
 
     logger.info(f"모니터링 시작 등록: {hist_path}")
     
     # 결과 메시지 생성
     msg_lines = [
-        f"✅ *{dep_city} → {arr_city} 모니터링 시작*",
-        f"🛫 {dep_airport}",
-        f"🛬 {arr_airport}",
-        f"📅 {d_date[:4]}/{d_date[4:6]}/{d_date[6:]} → {r_date[:4]}/{r_date[4:6]}/{r_date[6:]}",
+        f"✅ *{dep_city} ↔ {arr_city} 모니터링 시작*",
+        f"🛫 가는 편: {dep_airport} → {arr_airport}",
+        f"🛬 오는 편: {arr_airport} → {dep_airport}",
+        f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
+        "",
+        "⚙️ *적용된 시간 제한*",
+        f"• 가는 편: {format_time_range(user_config, 'outbound')}",
+        f"• 오는 편: {format_time_range(user_config, 'inbound')}",
         "",
         "📊 *현재 최저가*"
     ]
     
     if restricted:
         msg_lines.extend([
-            "🎯 *조건부 최저가* (출발 12시 이전, 도착 14시 이후)",
+            "🎯 *시간 제한 적용 최저가*",
             r_info,
             ""
         ])
@@ -679,20 +920,20 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data['chat_id']
-    depart, arrive, d_date, r_date = data['settings']
+    outbound_dep, outbound_arr, outbound_date, inbound_date = data['settings']
     hist_path = Path(data['hist_path'])
-    logger.info(f"monitor_job 실행: {depart}->{arrive}, 히스토리 파일: {hist_path.name}")
+    logger.info(f"monitor_job 실행: {outbound_dep}->{outbound_arr}, 히스토리 파일: {hist_path.name}")
 
     state = json.loads(hist_path.read_text(encoding='utf-8'))
     old_restr = state.get("restricted", 0)
     old_overall = state.get("overall", 0)
 
     loop = asyncio.get_running_loop()
-    restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, depart, arrive, d_date, r_date)
+    restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, outbound_dep, outbound_arr, outbound_date, inbound_date, chat_id)
 
     # 공항 정보 가져오기
-    _, dep_city, _ = get_airport_info(depart)
-    _, arr_city, _ = get_airport_info(arrive)
+    _, dep_city, _ = get_airport_info(outbound_dep)
+    _, arr_city, _ = get_airport_info(outbound_arr)
 
     notify = False
     msg_lines = []
@@ -700,19 +941,19 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     if restricted and restricted < old_restr:
         notify = True
         msg_lines.extend([
-            f"📉 *{dep_city} → {arr_city} 가격 하락 알림*",
+            f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*",
             "",
-            "🎯 *조건부 최저가* (출발 12시 이전, 도착 14시 이후)",
+            "🎯 *시간 제한 적용 최저가*",
             f"💰 {old_restr:,}원 → *{restricted:,}원* (-{old_restr - restricted:,}원)",
             r_info
         ])
-        logger.info(f"조건 최저가 하락: {old_restr} → {restricted}")
+        logger.info(f"시간 제한 적용 최저가 하락: {old_restr} → {restricted}")
         
     if overall and overall < old_overall:
         notify = True
         if not msg_lines:  # 첫 번째 알림인 경우
             msg_lines.extend([
-                f"📉 *{dep_city} → {arr_city} 가격 하락 알림*",
+                f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*",
                 ""
             ])
         msg_lines.extend([
@@ -726,7 +967,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     if notify:
         msg_lines.extend([
             "",
-            f"📅 {d_date[:4]}/{d_date[4:6]}/{d_date[6:]} → {r_date[:4]}/{r_date[4:6]}/{r_date[6:]}",
+            f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
             f"[🔗 네이버 항공권]({link})"
         ])
         await context.bot.send_message(
@@ -741,7 +982,9 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         "start_time": state.get("start_time"),
         "restricted": restricted or old_restr,
         "overall": overall or old_overall,
-        "last_fetch": format_datetime(datetime.now())
+        "last_fetch": format_datetime(datetime.now()),
+        "outbound_before": format_time_range(get_user_config(chat_id), 'outbound'),
+        "inbound_after": format_time_range(get_user_config(chat_id), 'inbound')
     }
     hist_path.write_text(json.dumps(new_state), encoding='utf-8')
     logger.debug("상태 파일 업데이트 완료")
@@ -899,66 +1142,38 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
         return
 
-    msg_lines = [f"📋 전체 모니터링 상태 ({len(files)}건):"]
-    now = datetime.now(KST)
-
-    for idx, hist_path in enumerate(files, start=1):
+    # 사용자별 모니터링 개수 집계
+    user_counts = defaultdict(int)
+    for hist_path in files:
         try:
-            # 파일명에서 정보 추출
             m = PATTERN.fullmatch(hist_path.name)
             if not m:
                 continue
-
             uid = int(m.group("uid"))
-            dep, arr = m.group("dep"), m.group("arr")
-            dd, rd = m.group("dd"), m.group("rd")
-
-            # 파일에서 데이터 읽기
-            try:
-                data = load_json_data(hist_path)
-                restricted = data.get("restricted", 0)
-                overall = data.get("overall", 0)
-                last_fetch = data.get("last_fetch", "알 수 없음")
-                start_time = data.get("start_time", "알 수 없음")
-
-                # 경과 시간 계산
-                try:
-                    start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-                    elapsed = (now - start_dt).days
-                    elapsed_str = f"{elapsed}일"
-                except (ValueError, TypeError):
-                    elapsed_str = "알 수 없음"
-
-                # 마지막 조회 시간으로부터 경과 시간 계산
-                try:
-                    last_dt = datetime.strptime(last_fetch, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-                    last_elapsed = now - last_dt
-                    if last_elapsed > timedelta(hours=1):
-                        status = "⚠️ 응답 없음"
-                    else:
-                        status = "✅ 정상"
-                except (ValueError, TypeError):
-                    status = "❓ 상태 불명"
-
-                msg_lines.append(f"{idx}. {uid} | {dep}→{arr} {dd}~{rd} | {status}")
-                msg_lines.append(f"   • 조건최저가: {restricted:,}원\n   • 전체최저가: {overall:,}원")
-                msg_lines.append(f"   • 조회시작일: {start_time}\n   • 마지막조회: {last_fetch}")
-                msg_lines.append(f"   • 경과된일수: {elapsed_str}")
-
-            except (json.JSONDecodeError, FileNotFoundError) as e:
-                msg_lines.append(f"{idx}. {uid} | {dep}→{arr} {dd}~{rd} | ❌ 파일 오류")
-                logger.error(f"데이터 파일 읽기 오류 ({hist_path.name}): {e}")
-
+            user_counts[uid] += 1
         except Exception as e:
-            msg_lines.append(f"{idx}. 파일 처리 중 오류 발생: {hist_path.name}")
             logger.error(f"모니터링 상태 처리 중 오류 발생: {e}")
 
-    # 메시지 분할 전송
-    full_message = "\n".join(msg_lines)
-    MAX_LEN = 4000
-    for i in range(0, len(full_message), MAX_LEN):
-        chunk = full_message[i:i+MAX_LEN]
-        await update.message.reply_text(chunk)
+    # 결과 메시지 생성
+    total_users = len(user_counts)
+    total_monitors = len(files)
+    msg_lines = [
+        f"📊 *전체 모니터링 현황*",
+        f"• 총 사용자 수: {total_users}명",
+        f"• 총 모니터링 수: {total_monitors}건",
+        "",
+        "📋 *사용자별 모니터링 현황*"
+    ]
+
+    # 사용자별 모니터링 개수 정렬 (개수 내림차순)
+    sorted_users = sorted(user_counts.items(), key=lambda x: (-x[1], x[0]))
+    for uid, count in sorted_users:
+        msg_lines.append(f"• 사용자 {uid}: {count}건")
+
+    await update.message.reply_text(
+        "\n".join(msg_lines),
+        parse_mode="Markdown"
+    )
 
 async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1024,38 +1239,57 @@ async def on_startup(app):
     monitors = app.bot_data.setdefault("monitors", {})
     logger.info("봇 시작 시 on_startup 실행")
     for hist_path in DATA_DIR.glob("price_*.json"):
-        m = PATTERN.fullmatch(hist_path.name)
-        if not m:
-            continue
-        data = json.loads(hist_path.read_text(encoding="utf-8"))
-        start_time_str = data.get("start_time")
         try:
-            start_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-        except Exception:
-            start_time = now
-        last_fetch_str = data.get("last_fetch")
-        try:
-            last_fetch = datetime.strptime(last_fetch_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-            delta = now - last_fetch
-        except Exception:
-            delta = timedelta(minutes=999)
-        interval = timedelta(minutes=30)
-        first_delay = timedelta(seconds=0) if delta >= interval else interval - delta
-        uid = int(m.group("uid"))
-        dep, arr, dd, rd = m.group("dep"), m.group("arr"), m.group("dd"), m.group("rd")
-        job = app.job_queue.run_repeating(
-            monitor_job,
-            interval=interval,
-            first=first_delay,
-            name=str(hist_path),
-            data={
-                "chat_id": uid,
+            m = PATTERN.fullmatch(hist_path.name)
+            if not m:
+                continue
+            data = json.loads(hist_path.read_text(encoding="utf-8"))
+            start_time_str = data.get("start_time")
+            try:
+                start_time = datetime.strptime(
+                    start_time_str,
+                    "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=KST)
+            except Exception:
+                start_time = now
+            last_fetch_str = data.get("last_fetch")
+            try:
+                last_fetch = datetime.strptime(
+                    last_fetch_str,
+                    "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=KST)
+                delta = now - last_fetch
+            except Exception:
+                delta = timedelta(minutes=999)
+            interval = timedelta(minutes=30)
+            first_delay = timedelta(seconds=0) if delta >= interval else interval - delta
+            uid = int(m.group("uid"))
+            dep, arr, dd, rd = m.group("dep"), m.group("arr"), m.group("dd"), m.group("rd")
+            job = app.job_queue.run_repeating(
+                monitor_job,
+                interval=interval,
+                first=first_delay,
+                name=str(hist_path),
+                data={
+                    "chat_id": uid,
+                    "settings": (dep, arr, dd, rd),
+                    "hist_path": str(hist_path)
+                }
+            )
+            monitors.setdefault(uid, []).append({
                 "settings": (dep, arr, dd, rd),
-                "hist_path": str(hist_path)
-            }
-        )
-        monitors.setdefault(uid, []).append({"settings": (dep, arr, dd, rd), "start_time": start_time, "hist_path": str(hist_path), "job": job})
-        logger.info(f"복원된 모니터링: {hist_path.name}")
+                "start_time": start_time,
+                "hist_path": str(hist_path),
+                "job": job
+            })
+            logger.info(f"복원된 모니터링: {hist_path.name}")
+        except Exception as ex:
+            logger.error(f"모니터링 복원 중 오류 발생 ({hist_path.name}): {ex}")
+            try:
+                hist_path.unlink()
+                logger.info(f"손상된 모니터링 파일 삭제: {hist_path.name}")
+            except Exception:
+                pass
 
 @contextlib.contextmanager
 def file_lock(file_path):
@@ -1083,19 +1317,48 @@ def load_json_data(file_path: Path) -> dict:
             return json.load(f)
 
 async def cleanup_old_data():
-    """오래된 모니터링 데이터 정리"""
+    """오래된 모니터링 데이터와 설정 파일 정리"""
     retention_days = int(os.getenv("DATA_RETENTION_DAYS", "30"))
+    config_retention_days = 7  # 설정 파일 보관 기간
     cutoff_date = datetime.now(KST) - timedelta(days=retention_days)
+    config_cutoff_date = datetime.now(KST) - timedelta(days=config_retention_days)
     
+    # 오래된 모니터링 데이터 정리
     for file_path in DATA_DIR.glob("price_*.json"):
         try:
             data = load_json_data(file_path)
-            start_time = datetime.fromisoformat(data["start_time"])
+            start_time = datetime.strptime(
+                data["start_time"],
+                "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=KST)
             if start_time < cutoff_date:
                 logger.info(f"오래된 데이터 삭제: {file_path.name}")
                 file_path.unlink()
         except Exception as ex:
             logger.warning(f"데이터 정리 중 오류 발생: {ex}")
+    
+    # 오래된 설정 파일 정리
+    for config_file in USER_CONFIG_DIR.glob("config_*.json"):
+        try:
+            with file_lock(config_file):
+                data = json.loads(config_file.read_text(encoding='utf-8'))
+                last_activity = datetime.strptime(
+                    data.get('last_activity', data['created_at']),
+                    '%Y-%m-%d %H:%M:%S'
+                ).replace(tzinfo=KST)
+                
+                # 마지막 활동으로부터 일주일이 지났고, 활성화된 모니터링이 없는 경우
+                if last_activity < config_cutoff_date:
+                    user_id = int(config_file.stem.split('_')[1])
+                    active_monitors = [
+                        p for p in DATA_DIR.glob(f"price_{user_id}_*.json")
+                        if p.exists()
+                    ]
+                    if not active_monitors:
+                        logger.info(f"비활성 사용자 설정 삭제: {config_file.name}")
+                        config_file.unlink()
+        except Exception as ex:
+            logger.warning(f"설정 파일 정리 중 오류 발생: {ex}")
 
 async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """공항 코드 목록 보기"""
@@ -1139,6 +1402,8 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("airport", airport_cmd))
+    application.add_handler(CommandHandler("settings", settings_cmd))  # 설정 확인
+    application.add_handler(CommandHandler("set", set_cmd))  # 설정 변경
     
     # 관리자 명령어
     if ADMIN_IDS:
