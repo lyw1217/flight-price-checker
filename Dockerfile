@@ -1,10 +1,12 @@
 FROM python:3.10-slim
 
-# 최소 실행에 필요한 패키지만 설치
-RUN apt-get update && apt-get install -y \
-    curl \
+# 시스템 패키지 설치
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
+# 작업 디렉토리 설정
 WORKDIR /app
 
 # 파이썬 의존성
