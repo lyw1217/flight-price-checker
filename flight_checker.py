@@ -74,6 +74,7 @@ def format_datetime(dt: datetime) -> str:
 
 # 항공권 조회 로직
 def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
+    logger.info(f"fetch_prices 호출: {depart}->{arrive} {d_date}~{r_date}")
     url = (
         f"https://flight.naver.com/flights/international/"
         f"{depart}-{arrive}-{d_date}/{arrive}-{depart}-{r_date}?adult=1&fareType=Y"
@@ -94,6 +95,7 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
     restricted_info = ""
     try:
         driver.get(url)
+        logger.debug("페이지 로드 완료, 필터 대기 중...")
         WebDriverWait(driver, 40).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, '[class^="inlineFilter_FilterWrapper__"]')
@@ -101,6 +103,7 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
         )
         time.sleep(5)
         items = driver.find_elements(By.XPATH, '//*[@id="international-content"]/div/div[3]/div')
+        logger.debug(f"크롤링 항목 개수: {len(items)}")
         for item in items:
             text = item.text
             if "경유" in text:
@@ -124,6 +127,7 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str):
                         f"귀국: {m_ret.group(1)} → {m_ret.group(2)}\n"
                         f"왕복 가격: {price:,}원"
                     )
+        logger.info("fetch_prices 완료")
     except Exception as ex:
         logger.exception(f"fetch_prices 오류: {ex}")
     finally:
@@ -148,15 +152,16 @@ async def help_text() -> str:
     )
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"사용자 {update.effective_user.id} 요청: /help")
     await update.message.reply_text(await help_text())
-    logger.info(f"[{update.effective_user.id}] /help 호출")
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"사용자 {update.effective_user.id} 요청: /start")
     await update.message.reply_text(await help_text())
-    logger.info(f"[{update.effective_user.id}] /start 호출")
 
 # 모니터 명령 핸들러
 async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"사용자 {update.effective_user.id} 요청: /monitor")
     await update.message.reply_text("⚙️ 입력 예시: ICN FUK 20251025 20251027 (YYYYMMDD)")
     return SETTING
 
@@ -172,7 +177,9 @@ def valid_date(d: str) -> bool:
 
 async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().split()
+    logger.debug(f"monitor_setting 입력: {text}")
     if len(text) != 4 or not (valid_date(text[2]) and valid_date(text[3])):
+        logger.warning("monitor_setting: 형식 오류")
         await update.message.reply_text("❗ 형식 오류. 예: ICN FUK 20251025 20251027")
         return SETTING
 
@@ -180,9 +187,11 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     existing = [p for p in DATA_DIR.iterdir() if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id]
     if len(existing) >= MAX_MONITORS:
+        logger.warning(f"사용자 {user_id} 최대 모니터링 초과")
         await update.message.reply_text(f"❗ 최대 {MAX_MONITORS}개까지 모니터링할 수 있습니다.")
         return ConversationHandler.END
 
+    logger.info(f"사용자 {user_id} 설정: {depart}->{arrive} {d_date}~{r_date}")
     await update.message.reply_text("✅ 모니터링 설정 완료. 첫 조회 중...")
     loop = asyncio.get_running_loop()
     restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, depart, arrive, d_date, r_date)
@@ -215,6 +224,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "job":        job
     })
 
+    logger.info(f"모니터링 시작 등록: {hist_path}")
     await update.message.reply_text(
         f"✅ 모니터링 시작: {depart}→{arrive} {d_date}~{r_date}\n"
         f"[조건 최저가]\n{r_info}\n"
@@ -225,22 +235,23 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
-    chat_id = data['chat_id']
     depart, arrive, d_date, r_date = data['settings']
     hist_path = Path(data['hist_path'])
+    logger.info(f"monitor_job 실행: {depart}->{arrive} 저장소 {hist_path.name}")
 
     state = json.loads(hist_path.read_text(encoding='utf-8'))
     old_restr = state.get("restricted", 0)
     old_overall = state.get("overall", 0)
-    start_time_str = state.get("start_time")
-
     loop = asyncio.get_running_loop()
     restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, depart, arrive, d_date, r_date)
+
     notify = False
     if restricted and restricted < old_restr:
         notify = True
+        logger.info(f"가격 하락 감지: 조건최저가 {old_restr}→{restricted}")
     if overall and overall < old_overall:
         notify = True
+        logger.info(f"가격 하락 감지: 전체최저가 {old_overall}→{overall}")
 
     if notify:
         msg = (
@@ -249,18 +260,21 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
             f"[전체] {overall or '없음'}원\n{o_info}\n"
             f"🔗 {link}"
         )
-        await context.bot.send_message(chat_id, msg)
+        await context.bot.send_message(data['chat_id'], msg)
+        logger.info("알림 전송 완료")
 
     new_state = {
-        "start_time": start_time_str,
+        "start_time": state.get("start_time"),
         "restricted": restricted or old_restr,
         "overall": overall or old_overall,
         "last_fetch": format_datetime(datetime.now())
     }
     hist_path.write_text(json.dumps(new_state), encoding='utf-8')
+    logger.debug("상태 파일 업데이트 완료")
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"사용자 {user_id} 요청: /status")
     files = sorted([
         p for p in DATA_DIR.iterdir()
         if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
@@ -275,7 +289,6 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for idx, hist in enumerate(files, start=1):
         info = PATTERN.fullmatch(hist.name).groupdict()
         data = json.loads(hist.read_text(encoding='utf-8'))
-
         start_dt = datetime.strptime(
             data['start_time'], '%Y-%m-%d %H:%M:%S'
         ).replace(tzinfo=KST)
@@ -290,31 +303,26 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg_lines))
 
-
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = update.message.text.strip().split()
-
-    # 인자가 정확히 하나만 있어야 처리
+    logger.info(f"사용자 {user_id} 요청: /cancel {args[1:] if len(args)>1 else ''}")
     if len(args) != 2:
         await update.message.reply_text("❗ 올바른 명령 형식: `/cancel <번호>` 또는 `/cancel all`", parse_mode="Markdown")
         return
 
     key = args[1].lower()
-    # 디스크에 저장된 JSON 파일 목록 조회
     files = sorted([
         p for p in DATA_DIR.iterdir()
         if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
     ])
-
     if key == 'all':
-        # 전체 삭제
         for hist in files:
             hist.unlink()
-            # JobQueue에서도 제거
             for job in ctx.application.job_queue.get_jobs_by_name(str(hist)):
                 job.schedule_removal()
         await update.message.reply_text("✅ 전체 모니터링을 취소했습니다.")
+        logger.info(f"사용자 {user_id} 전체 모니터링 취소")
         return
 
     if key.isdigit():
@@ -324,26 +332,23 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         target = files[idx]
-        # 파일 삭제
         target.unlink()
-        # JobQueue에서 제거
         for job in ctx.application.job_queue.get_jobs_by_name(str(target)):
             job.schedule_removal()
-
         await update.message.reply_text(f"✅ {key}번 모니터링을 취소했습니다.")
+        logger.info(f"사용자 {user_id} {key}번 모니터링 취소")
         return
 
-    # 그 외 잘못된 인자
     await update.message.reply_text("❗ 올바른 명령 형식: `/cancel <번호>` 또는 `/cancel all`", parse_mode="Markdown")
 
-# 관리자 전용: 전체 상태 조회
 async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    logger.info(f"관리자 {user_id} 요청: /all_status")
+    if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
 
     monitors = ctx.application.bot_data.get("monitors", {})
-    # 모든 모니터링 항목을 펼쳐서 리스트로
     entries = []
     for uid, mons in monitors.items():
         for mon in mons:
@@ -353,7 +358,6 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
         return
 
-    # 메시지 생성
     msg_lines = [f"📋 전체 모니터링 상태 ({total}건):"]
     now = datetime.now(KST)
     for idx, (uid, mon) in enumerate(entries, start=1):
@@ -364,13 +368,8 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         overall = data.get("overall", 0)
         last_fetch = data.get("last_fetch", "")
         start_time = data.get("start_time", "")
-        # 경과일 계산
-        if start_time:
-            start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-            elapsed = (now - start_dt).days
-        else:
-            elapsed = 0
-
+        start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST) if start_time else now
+        elapsed = (now - start_dt).days
         msg_lines.append(f"{idx}. {uid} | {dep}→{arr} {dd}~{rd}")
         msg_lines.append(f"   • 조건최저가: {restricted:,}원\n   • 전체최저가: {overall:,}원")
         msg_lines.append(f"   • 조회시작일: {start_time}\n   • 마지막조회: {last_fetch}")
@@ -383,16 +382,15 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chunk = full_message[i:i+MAX_LEN]
         await update.message.reply_text(chunk)
 
-
-# 관리자 전용: 전체 모니터링 취소
 async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    logger.info(f"관리자 {user_id} 요청: /all_cancel")
+    if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
 
     monitors = ctx.application.bot_data.get("monitors", {})
     count = 0
-
     for uid, mons in list(monitors.items()):
         for mon in mons:
             job = mon.get("job")
@@ -402,47 +400,34 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             hist = Path(mon.get("hist_path", ""))
             if hist.exists():
                 hist.unlink()
-        # 해당 uid의 리스트 삭제
         monitors.pop(uid, None)
-
     await update.message.reply_text(f"✅ 전체 모니터링 종료: {count}건")
+    logger.info(f"전체 모니터링 종료: {count}건")
 
 async def on_startup(app):
     now = datetime.now(KST)
     monitors = app.bot_data.setdefault("monitors", {})
-
+    logger.info("봇 시작 시 on_startup 실행")
     for hist_path in DATA_DIR.glob("price_*.json"):
         m = PATTERN.fullmatch(hist_path.name)
         if not m:
             continue
-
-        # JSON에서 start_time, last_fetch 파싱
         data = json.loads(hist_path.read_text(encoding="utf-8"))
         start_time_str = data.get("start_time")
         try:
             start_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
         except Exception:
-            start_time = now  # 파싱 실패 시 현재 시각 사용
-
+            start_time = now
         last_fetch_str = data.get("last_fetch")
         try:
             last_fetch = datetime.strptime(last_fetch_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-        except Exception:
-            # 파싱 실패 시 즉시 실행
-            delta = timedelta(minutes=999)
-        else:
             delta = now - last_fetch
-
-        # 지연 시간 계산
+        except Exception:
+            delta = timedelta(minutes=999)
         interval = timedelta(minutes=30)
-        if delta >= interval:
-            first_delay = timedelta(seconds=0)
-        else:
-            first_delay = interval - delta
-
+        first_delay = timedelta(seconds=0) if delta >= interval else interval - delta
         uid = int(m.group("uid"))
         dep, arr, dd, rd = m.group("dep"), m.group("arr"), m.group("dd"), m.group("rd")
-        
         job = app.job_queue.run_repeating(
             monitor_job,
             interval=interval,
@@ -454,22 +439,16 @@ async def on_startup(app):
                 "hist_path": str(hist_path)
             }
         )
-
-        monitors.setdefault(uid, []).append({
-            "settings":   (dep, arr, dd, rd),
-            "start_time": start_time,
-            "hist_path":  str(hist_path),
-            "job":        job
-        })
-
-        logger.info(f"▶ 복원된 모니터링: {hist_path.name}")
+        monitors.setdefault(uid, []).append({"settings": (dep, arr, dd, rd), "start_time": start_time, "hist_path": str(hist_path), "job": job})
+        logger.info(f"복원된 모니터링: {hist_path.name}")
 
 def main():
+    logger.info("메인 함수 시작: ApplicationBuilder 설정 중...")
     app = ApplicationBuilder()\
         .token(BOT_TOKEN)\
         .post_init(on_startup)\
         .build()
-
+    logger.info("핸들러 등록 중...")
     conv = ConversationHandler(
         entry_points=[CommandHandler("monitor", monitor_cmd)],
         states={SETTING: [MessageHandler(filters.TEXT & ~filters.COMMAND, monitor_setting)]},
@@ -482,7 +461,6 @@ def main():
     app.add_handler(CommandHandler("all_status", all_status))
     app.add_handler(CommandHandler("all_cancel", all_cancel))
     app.add_handler(conv)
-
     logger.info("✈️ Flight Bot 시작")
     app.run_polling()
 
