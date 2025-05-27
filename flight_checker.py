@@ -309,12 +309,12 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
     # 사용자 설정 가져오기
     if user_id:
         config = get_user_config(user_id)
-        outbound_start, outbound_end = get_time_range(config, 'outbound')
-        inbound_start, inbound_end = get_time_range(config, 'inbound')
     else:
         # 기본값 사용
-        outbound_start, outbound_end = get_time_range(DEFAULT_USER_CONFIG, 'outbound')
-        inbound_start, inbound_end = get_time_range(DEFAULT_USER_CONFIG, 'inbound')
+        config = DEFAULT_USER_CONFIG.copy()
+        
+    outbound_start, outbound_end = get_time_range(config, 'outbound')
+    inbound_start, inbound_end = get_time_range(config, 'inbound')
     
     for attempt in range(max_retries):
         try:
