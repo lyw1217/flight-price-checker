@@ -21,12 +21,14 @@ from pathlib import Path
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from collections import defaultdict
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ConversationHandler,
-    ContextTypes, filters, JobQueue
+    ContextTypes, filters, JobQueue,
+    CallbackQueryHandler
 )
+from telegram import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -175,9 +177,12 @@ async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 밤2 (21-24)"
     ]
     
+    # 관리자 여부에 따라 다른 키보드 표시
+    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
         "\n".join(msg_lines),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
 
 async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -447,13 +452,44 @@ async def help_text() -> str:
         + admin_help
     )
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"사용자 {update.effective_user.id} 요청: /help")
-    await update.message.reply_text(await help_text(), parse_mode="Markdown")
+def get_base_keyboard() -> ReplyKeyboardMarkup:
+    """기본 키보드 버튼 생성"""
+    keyboard = [
+        [KeyboardButton("/monitor"), KeyboardButton("/status")],
+        [KeyboardButton("/settings"), KeyboardButton("/airport")],
+        [KeyboardButton("/cancel"), KeyboardButton("/help")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_admin_keyboard() -> ReplyKeyboardMarkup:
+    """관리자용 키보드 버튼 생성"""
+    keyboard = [
+        [KeyboardButton("/monitor"), KeyboardButton("/status")],
+        [KeyboardButton("/settings"), KeyboardButton("/airport")],
+        [KeyboardButton("/cancel"), KeyboardButton("/help")],
+        [KeyboardButton("/allstatus"), KeyboardButton("/allcancel")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /start")
-    await update.message.reply_text(await help_text(), parse_mode="Markdown")
+    # 관리자 여부에 따라 다른 키보드 표시
+    keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
+    await update.message.reply_text(
+        await help_text(),
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"사용자 {update.effective_user.id} 요청: /help")
+    # 관리자 여부에 따라 다른 키보드 표시
+    keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
+    await update.message.reply_text(
+        await help_text(),
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
 
 # 환경변수 검증
 def validate_env_vars() -> list[str]:
@@ -540,7 +576,12 @@ async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 공항코드: 3자리 영문",
         "• 날짜: YYYYMMDD"
     ]
-    await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
+    # 모니터링 설정 시에는 키보드 숨기기
+    await update.message.reply_text(
+        "\n".join(msg_lines),
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
     return SETTING
 
 # 유효 날짜 체크
@@ -941,10 +982,13 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         link
     ])
     
+    # 모니터링 설정 완료 후 키보드 다시 표시
+    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
         "\n".join(msg_lines),
-        parse_mode="Markdown"#,
-        #disable_web_page_preview=True
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=keyboard
     )
     return ConversationHandler.END
 
@@ -1078,34 +1122,102 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💡 새로운 모니터링을 시작하려면 /monitor 명령을 사용하세요."
     ])
 
+    # status 명령어 실행 시 키보드 유지
+    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
         "\n".join(msg_lines),
+        parse_mode="Markdown",
         disable_web_page_preview=True,
-        parse_mode="Markdown"
+        reply_markup=keyboard
     )
 
 @rate_limit
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    args = update.message.text.strip().split()
-    logger.info(f"사용자 {user_id} 요청: /cancel {args[1:] if len(args)>1 else ''}")
-    if len(args) != 2:
-        await update.message.reply_text("❗ 올바른 명령 형식: `/cancel <번호>` 또는 `/cancel all`", parse_mode="Markdown")
-        return
-
-    key = args[1].lower()
+    logger.info(f"사용자 {user_id} 요청: /cancel")
+    
+    # 모니터링 파일 찾기
     files = sorted([
         p for p in DATA_DIR.iterdir()
         if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
     ])
+    
+    if not files:
+        keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+        await update.message.reply_text(
+            "현재 실행 중인 모니터링이 없습니다.\n"
+            "새로운 모니터링을 시작하려면 /monitor 명령을 사용하세요.",
+            reply_markup=keyboard
+        )
+        return
+
+    msg_lines = ["📋 *취소할 모니터링을 선택하세요*"]
+    keyboard = []
+
+    for idx, hist in enumerate(files, start=1):
+        info = PATTERN.fullmatch(hist.name).groupdict()
+        data = json.loads(hist.read_text(encoding='utf-8'))
+        
+        # 공항 정보 가져오기
+        dep, arr = info['dep'], info['arr']
+        _, dep_city, _ = get_airport_info(dep)
+        _, arr_city, _ = get_airport_info(arr)
+        dep_city = dep_city or dep
+        arr_city = arr_city or arr
+        
+        dd, rd = info['dd'], info['rd']
+        
+        # 모니터링 정보 표시
+        msg_lines.extend([
+            "",
+            f"*{idx}. {dep_city}({dep}) → {arr_city}({arr})*",
+            f"📅 {dd[:4]}/{dd[4:6]}/{dd[6:]} ~ {rd[:4]}/{rd[4:6]}/{rd[6:]}",
+            "💰 최저가 현황:",
+            f"  • 조건부: {data['restricted']:,}원" if data['restricted'] else "  • 조건부: 없음",
+            f"  • 전체: {data['overall']:,}원" if data['overall'] else "  • 전체: 없음"
+        ])
+        
+        # 인라인 버튼 추가
+        keyboard.append([
+            InlineKeyboardButton(
+                f"❌ {idx}번 모니터링 취소",
+                callback_data=f"cancel_{hist.name}"
+            )
+        ])
+
+    # 전체 취소 버튼 추가
+    keyboard.append([
+        InlineKeyboardButton(
+            "🗑️ 전체 모니터링 취소",
+            callback_data="cancel_all"
+        )
+    ])
+
+    await update.message.reply_text(
+        "\n".join(msg_lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    logger.info(f"사용자 {user_id} 콜백: {data}")
+    
     monitors = ctx.application.bot_data.get("monitors", {})
     user_mons = monitors.get(user_id, [])
+    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
 
-    if key == 'all':
+    if data == "cancel_all":
+        files = [
+            p for p in DATA_DIR.iterdir()
+            if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
+        ]
         if not files:
-            await update.message.reply_text("현재 실행 중인 모니터링이 없습니다.")
+            await query.answer("취소할 모니터링이 없습니다.")
             return
-            
+
         msg_lines = ["✅ 모든 모니터링이 취소되었습니다:"]
         for hist in files:
             m = PATTERN.fullmatch(hist.name)
@@ -1114,7 +1226,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # 공항 정보 가져오기
             _, dep_city, _ = get_airport_info(dep)
             _, arr_city, _ = get_airport_info(arr)
-            dep_city = dep_city or dep  # 데이터베이스에 없는 경우 코드 사용
+            dep_city = dep_city or dep
             arr_city = arr_city or arr
             msg_lines.append(
                 f"• {dep_city}({dep}) → {arr_city}({arr})\n"
@@ -1123,25 +1235,31 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             hist.unlink()
             for job in ctx.application.job_queue.get_jobs_by_name(str(hist)):
                 job.schedule_removal()
+        
         monitors.pop(user_id, None)
-        await update.message.reply_text("\n".join(msg_lines))
-        logger.info(f"사용자 {user_id} 전체 모니터링 취소")
+        await query.message.edit_text(
+            "\n".join(msg_lines),
+            parse_mode="Markdown"
+        )
+        await query.answer("모든 모니터링이 취소되었습니다.")
         return
 
-    if key.isdigit():
-        idx = int(key) - 1
-        if idx < 0 or idx >= len(files):
-            await update.message.reply_text("❗ 유효하지 않은 번호입니다.")
+    if data.startswith("cancel_"):
+        target_file = data[7:]  # "cancel_" 제거
+        target = DATA_DIR / target_file
+        
+        if not target.exists():
+            await query.answer("이미 취소된 모니터링입니다.")
             return
-
-        target = files[idx]
-        m = PATTERN.fullmatch(target.name)
+            
+        m = PATTERN.fullmatch(target_file)
         dep, arr = m.group("dep"), m.group("arr")
         dd, rd = m.group("dd"), m.group("rd")
+        
         # 공항 정보 가져오기
         _, dep_city, _ = get_airport_info(dep)
         _, arr_city, _ = get_airport_info(arr)
-        dep_city = dep_city or dep  # 데이터베이스에 없는 경우 코드 사용
+        dep_city = dep_city or dep
         arr_city = arr_city or arr
         
         target.unlink()
@@ -1158,11 +1276,12 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"• {dep_city}({dep}) → {arr_city}({arr})",
             f"  {dd[:4]}/{dd[4:6]}/{dd[6:]} ~ {rd[:4]}/{rd[4:6]}/{rd[6:]}"
         ]
-        await update.message.reply_text("\n".join(msg_lines))
-        logger.info(f"사용자 {user_id} {key}번 모니터링 취소")
-        return
-
-    await update.message.reply_text("❗ 올바른 명령 형식: `/cancel <번호>` 또는 `/cancel all`", parse_mode="Markdown")
+        
+        await query.message.edit_text(
+            "\n".join(msg_lines),
+            parse_mode="Markdown"
+        )
+        await query.answer("모니터링이 취소되었습니다.")
 
 async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1424,9 +1543,12 @@ async def cleanup_old_data():
 async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """공항 코드 목록 보기"""
     logger.info(f"사용자 {update.effective_user.id} 요청: /airport")
+    # airport 명령어 실행 시 키보드 유지
+    keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
         format_airport_list(),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
 
 def main():
@@ -1463,8 +1585,11 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("airport", airport_cmd))
-    application.add_handler(CommandHandler("settings", settings_cmd))  # 설정 확인
-    application.add_handler(CommandHandler("set", set_cmd))  # 설정 변경
+    application.add_handler(CommandHandler("settings", settings_cmd))
+    application.add_handler(CommandHandler("set", set_cmd))
+    
+    # 콜백 쿼리 핸들러 추가
+    application.add_handler(CallbackQueryHandler(cancel_callback))
     
     # 관리자 명령어
     if ADMIN_IDS:
