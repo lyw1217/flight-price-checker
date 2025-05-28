@@ -126,7 +126,7 @@ def get_time_range(config: dict, direction: str) -> tuple[time, time]:
             return time(hour=0, minute=0), time(hour=hour, minute=0)
         else:
             # 오는 편은 "이후"이므로 정확한 시각이 시작 시각
-            return time(hour=hour, minute=0), time(hour=24, minute=0)
+            return time(hour=hour, minute=0), time(hour=23, minute=59)
 
 def format_time_range(config: dict, direction: str) -> str:
     """시간 설정을 문자열로 변환합니다."""
@@ -352,25 +352,40 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                     text = item.text
                     if "경유" in text:
                         continue
-                    m_dep = re.search(rf'(\d{{2}}:\d{{2}}){depart}\s+(\d{{2}}:\d{{2}}){arrive}', text)
-                    m_ret = re.search(rf'(\d{{2}}:\d{{2}}){arrive}\s+(\d{{2}}:\d{{2}}){depart}', text)
-                    m_price = re.search(r'왕복\s([\d,]+)원', text)
+
+                    logger.debug(f"항공권 정보: {text}")
+                    
+                    # 가는 편: 출발지에서 도착지로 가는 항공편
+                    m_dep = re.search(rf'{depart}\s+(\d{{2}}:\d{{2}})\s*→\s*(\d{{2}}:\d{{2}})\s+{arrive}', text)
+                    # 오는 편: 도착지에서 출발지로 오는 항공편
+                    m_ret = re.search(rf'{arrive}\s+(\d{{2}}:\d{{2}})\s*→\s*(\d{{2}}:\d{{2}})\s+{depart}', text)
+                    m_price = re.search(r'왕복\s*([\d,]+)원', text)
+                    
                     if not (m_dep and m_ret and m_price):
                         continue
                         
                     found_any_price = True
                     price = int(m_price.group(1).replace(",", ""))
+                    
+                    # 가는 편 출발/도착 시각
+                    dep_departure = m_dep.group(1)  # 출발 시각
+                    dep_arrival = m_dep.group(2)    # 도착 시각
+                    
+                    # 오는 편 출발/도착 시각
+                    ret_departure = m_ret.group(1)  # 출발 시각
+                    ret_arrival = m_ret.group(2)    # 도착 시각
+                    
                     if overall_price is None or price < overall_price:
                         overall_price = price
                         overall_info = (
-                            f"가는 편: {m_dep.group(1)} → {m_dep.group(2)}\n"
-                            f"오는 편: {m_ret.group(1)} → {m_ret.group(2)}\n"
+                            f"가는 편: {dep_departure} → {dep_arrival}\n"
+                            f"오는 편: {ret_departure} → {ret_arrival}\n"
                             f"왕복 가격: {price:,}원"
                         )
                     
                     # 시간 제한 적용
-                    dep_t = datetime.strptime(m_dep.group(1), "%H:%M").time()
-                    ret_t = datetime.strptime(m_ret.group(1), "%H:%M").time()
+                    dep_t = datetime.strptime(dep_departure, "%H:%M").time()  # 가는 편 출발 시각
+                    ret_t = datetime.strptime(ret_departure, "%H:%M").time()  # 오는 편 출발 시각
                     
                     # 시간대 또는 시각 제한 체크
                     if config['time_type'] == 'time_period':
@@ -386,8 +401,8 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                         if restricted_price is None or price < restricted_price:
                             restricted_price = price
                             restricted_info = (
-                                f"가는 편: {m_dep.group(1)} → {m_dep.group(2)}\n"
-                                f"오는 편: {m_ret.group(1)} → {m_ret.group(2)}\n"
+                                f"가는 편: {dep_departure} → {dep_arrival}\n"
+                                f"오는 편: {ret_departure} → {ret_arrival}\n"
                                 f"왕복 가격: {price:,}원"
                             )
                 
@@ -984,14 +999,13 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         msg_lines.extend([
             "",
             f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-            f"[🔗 네이버 항공권]",
-            f"{link}"
+            "🔗 네이버 항공권:",
+            link
         ])
         await context.bot.send_message(
             chat_id,
             "\n".join(msg_lines),
-            parse_mode="Markdown"#,
-            #disable_web_page_preview=True
+            parse_mode="Markdown"
         )
         logger.info("가격 하락 알림 전송 완료")
 
@@ -1001,6 +1015,8 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         "overall": overall or old_overall,
         "last_fetch": format_datetime(datetime.now()),
         "outbound_before": format_time_range(get_user_config(chat_id), 'outbound'),
+        "outbound_after": format_time_range(get_user_config(chat_id), 'outbound'),
+        "inbound_before": format_time_range(get_user_config(chat_id), 'inbound'),
         "inbound_after": format_time_range(get_user_config(chat_id), 'inbound')
     }
     hist_path.write_text(json.dumps(new_state), encoding='utf-8')
@@ -1049,7 +1065,8 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"  • 조건부: {data['restricted']:,}원" if data['restricted'] else "  • 조건부: 없음",
             f"  • 전체: {data['overall']:,}원" if data['overall'] else "  • 전체: 없음",
             f"⏱️ 모니터링 {elapsed}일째 진행 중",
-            f"🔄 마지막 조회: {data['last_fetch']}"
+            f"🔄 마지막 조회: {data['last_fetch']}",
+            f"[🔗 네이버 항공권](https://flight.naver.com/flights/international/{dep}-{arr}-{dd}/{arr}-{dep}-{rd}?adult=1&fareType=Y)"
         ])
 
     msg_lines.extend([
@@ -1063,6 +1080,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "\n".join(msg_lines),
+        disable_web_page_preview=True,
         parse_mode="Markdown"
     )
 
@@ -1286,14 +1304,13 @@ async def on_startup(app):
             # 30분 이상 지났거나 마지막 조회 시간이 없는 경우 즉시 실행
             interval = timedelta(minutes=30)
             delta = now - last_fetch
-            first_delay = timedelta(seconds=0) if delta >= interval else interval - delta
             
             uid = int(m.group("uid"))
             dep, arr, dd, rd = m.group("dep"), m.group("arr"), m.group("dd"), m.group("rd")
             
             # 즉시 실행이 필요한 경우 별도의 일회성 작업 추가
-            if first_delay == timedelta(seconds=0):
-                logger.info(f"즉시 조회 예약: {hist_path.name} (마지막 조회: {last_fetch_str})")
+            if delta >= interval:
+                logger.info(f"즉시 조회 예약: {hist_path.name} (마지막 조회: {last_fetch_str}, 경과 시간: {delta.total_seconds()/60:.1f}분)")
                 app.job_queue.run_once(
                     monitor_job,
                     when=0,
@@ -1305,11 +1322,14 @@ async def on_startup(app):
                     }
                 )
             
-            # 정기 모니터링 작업 등록
+            # 정기 모니터링 작업 등록 (다음 실행 시간은 마지막 조회 시간 기준으로 계산)
+            next_run = interval - (delta % interval)  # 다음 30분 간격까지 남은 시간
+            logger.info(f"정기 모니터링 등록: {hist_path.name} (다음 실행: {next_run.total_seconds()/60:.1f}분 후)")
+            
             job = app.job_queue.run_repeating(
                 monitor_job,
                 interval=interval,
-                first=first_delay,
+                first=next_run,
                 name=str(hist_path),
                 data={
                     "chat_id": uid,
@@ -1324,7 +1344,6 @@ async def on_startup(app):
                 "hist_path": str(hist_path),
                 "job": job
             })
-            logger.info(f"복원된 모니터링: {hist_path.name} (다음 실행: {first_delay.total_seconds():.1f}초 후)")
         except Exception as ex:
             logger.error(f"모니터링 복원 중 오류 발생 ({hist_path.name}): {ex}")
             try:
