@@ -414,8 +414,8 @@ async def help_text() -> str:
     if ADMIN_IDS:
         admin_help = (
             "\n\n👑 *관리자 명령어*\n"
-            "• /all_status - 전체 모니터링 현황\n"
-            "• /all_cancel - 전체 모니터링 취소"
+            "• /allstatus - 전체 모니터링 현황\n"
+            "• /allcancel - 전체 모니터링 취소"
         )
     
     return (
@@ -928,8 +928,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "\n".join(msg_lines),
-        parse_mode="Markdown",
-        disable_web_page_preview=True
+        parse_mode="Markdown"#,
+        #disable_web_page_preview=True
     )
     return ConversationHandler.END
 
@@ -984,13 +984,14 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         msg_lines.extend([
             "",
             f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-            f"[🔗 네이버 항공권]({link})"
+            f"[🔗 네이버 항공권]",
+            f"{link}"
         ])
         await context.bot.send_message(
             chat_id,
             "\n".join(msg_lines),
-            parse_mode="Markdown",
-            disable_web_page_preview=True
+            parse_mode="Markdown"#,
+            #disable_web_page_preview=True
         )
         logger.info("가격 하락 알림 전송 완료")
 
@@ -1147,7 +1148,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"관리자 {user_id} 요청: /all_status")
+    logger.info(f"관리자 {user_id} 요청: /allstatus")
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
@@ -1193,7 +1194,7 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"관리자 {user_id} 요청: /all_cancel")
+    logger.info(f"관리자 {user_id} 요청: /allcancel")
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
@@ -1448,8 +1449,8 @@ def main():
     
     # 관리자 명령어
     if ADMIN_IDS:
-        application.add_handler(CommandHandler("all_status", all_status))
-        application.add_handler(CommandHandler("all_cancel", all_cancel))
+        application.add_handler(CommandHandler("allstatus", all_status))
+        application.add_handler(CommandHandler("allcancel", all_cancel))
     
     # 시작 시 기존 모니터링 복원
     application.job_queue.run_once(on_startup, 0)
