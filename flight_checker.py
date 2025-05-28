@@ -109,18 +109,13 @@ def get_time_range(config: dict, direction: str) -> tuple[time, time]:
     if config['time_type'] == 'time_period':
         periods = config[f'{direction}_periods']
         period_ranges = [TIME_PERIODS[p] for p in periods]
-        start_hours = [start for start, _ in period_ranges]
-        end_hours = [end for _, end in period_ranges]
         
         if direction == 'outbound':
-            # 가는 편: 선택한 시간대에 포함되는 항공편만
-            return time(hour=min(start_hours), minute=0), time(hour=max(end_hours), minute=0)
+            # 가는 편: 선택한 시간대들의 각각의 범위를 모두 체크
+            return None, None  # 시간대는 개별 체크하도록 None 반환
         else:
-            # 오는 편: 선택한 시간대에 포함되는 항공편만
-            # 시간대가 연속되지 않을 경우를 위해 전체 범위로 설정
-            # 예: 오전1(06-09)과 오후2(15-18)를 선택한 경우
-            # 06:00-18:00 사이의 모든 항공편을 포함
-            return time(hour=min(start_hours), minute=0), time(hour=max(end_hours), minute=0)
+            # 오는 편: 선택한 시간대들의 각각의 범위를 모두 체크
+            return None, None  # 시간대는 개별 체크하도록 None 반환
     else:  # exact
         hour = config[f'{direction}_exact_hour']
         if direction == 'outbound':
@@ -321,6 +316,7 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
     outbound_start, outbound_end = get_time_range(config, 'outbound')
     inbound_start, inbound_end = get_time_range(config, 'inbound')
     
+    last_error = None
     for attempt in range(max_retries):
         try:
             options = Options()
@@ -355,20 +351,39 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                 found_any_price = False
                 for item in items:
                     text = item.text
+                    logger.debug(f"항공권 정보 텍스트: {text}")
+                    
                     if "경유" in text:
+                        logger.debug("경유 항공편 제외")
                         continue
 
-                    logger.debug(f"항공권 정보: {text}")
-                    
                     # 가는 편: 출발지에서 도착지로 가는 항공편
-                    m_dep = re.search(rf'{depart}\s+(\d{{2}}:\d{{2}})\s*→\s*(\d{{2}}:\d{{2}})\s+{arrive}', text)
-                    # 오는 편: 도착지에서 출발지로 오는 항공편
-                    m_ret = re.search(rf'{arrive}\s+(\d{{2}}:\d{{2}})\s*→\s*(\d{{2}}:\d{{2}})\s+{depart}', text)
-                    m_price = re.search(r'왕복\s*([\d,]+)원', text)
-                    
-                    if not (m_dep and m_ret and m_price):
+                    # 예: ICN 07:00 → 09:00 FUK
+                    m_dep = re.search(rf'(\d{{2}}:\d{{2}}){depart}\s+(\d{{2}}:\d{{2}}){arrive}', text, re.IGNORECASE)
+                    if m_dep:
+                        logger.debug(f"가는 편 매칭: 출발={m_dep.group(1)}, 도착={m_dep.group(2)}")
+                    else:
+                        logger.debug("가는 편 매칭 실패")
                         continue
-                        
+
+                    # 오는 편: 도착지에서 출발지로 오는 항공편
+                    # 예: FUK 15:00 → 17:00 ICN
+                    m_ret = re.search(rf'(\d{{2}}:\d{{2}}){arrive}\s+(\d{{2}}:\d{{2}}){depart}', text, re.IGNORECASE)
+                    if m_ret:
+                        logger.debug(f"오는 편 매칭: 출발={m_ret.group(1)}, 도착={m_ret.group(2)}")
+                    else:
+                        logger.debug("오는 편 매칭 실패")
+                        continue
+
+                    # 가격 정보
+                    # 예: 왕복 374,524원
+                    m_price = re.search(r'왕복\s*([\d,]+)원', text)
+                    if m_price:
+                        logger.debug(f"가격 매칭: {m_price.group(1)}원")
+                    else:
+                        logger.debug("가격 매칭 실패")
+                        continue
+                    
                     found_any_price = True
                     price = int(m_price.group(1).replace(",", ""))
                     
@@ -387,6 +402,7 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                             f"오는 편: {ret_departure} → {ret_arrival}\n"
                             f"왕복 가격: {price:,}원"
                         )
+                        logger.debug(f"전체 최저가 갱신: {price:,}원")
                     
                     # 시간 제한 적용
                     dep_t = datetime.strptime(dep_departure, "%H:%M").time()  # 가는 편 출발 시각
@@ -394,33 +410,76 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                     
                     # 시간대 또는 시각 제한 체크
                     if config['time_type'] == 'time_period':
-                        # 시간대 설정: 범위 내에 있는지 확인
-                        is_valid_outbound = outbound_start <= dep_t <= outbound_end
-                        is_valid_inbound = inbound_start <= ret_t <= inbound_end
-                    else:
-                        # 시각 설정: 이전/이후 확인
-                        is_valid_outbound = dep_t <= outbound_end  # 이전
-                        is_valid_inbound = ret_t >= inbound_start  # 이후
+                        # 시간대 설정: 선택된 시간대 중 하나라도 포함되면 유효
+                        outbound_periods = config['outbound_periods']
+                        inbound_periods = config['inbound_periods']
+                        
+                        # 가는 편: 선택된 시간대 중 하나라도 포함되면 유효
+                        is_valid_outbound = False
+                        for period in outbound_periods:
+                            period_start, period_end = TIME_PERIODS[period]
+                            if period_start <= dep_t.hour < period_end:  # 시간 단위로 비교
+                                is_valid_outbound = True
+                                logger.debug(f"가는 편 시간대 매칭: {period} ({period_start}:00 <= {dep_t} < {period_end}:00)")
+                                break
+                        
+                        # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
+                        is_valid_inbound = False
+                        for period in inbound_periods:
+                            period_start, period_end = TIME_PERIODS[period]
+                            if period_start <= ret_t.hour < period_end:  # 시간 단위로 비교
+                                is_valid_inbound = True
+                                logger.debug(f"오는 편 시간대 매칭: {period} ({period_start}:00 <= {ret_t} < {period_end}:00)")
+                                break
+                        
+                        if not is_valid_outbound:
+                            logger.debug(f"가는 편 시간대 미매칭: {dep_t}는 선택된 시간대 {outbound_periods}에 포함되지 않음")
+                            continue
+                        if not is_valid_inbound:
+                            logger.debug(f"오는 편 시간대 미매칭: {ret_t}는 선택된 시간대 {inbound_periods}에 포함되지 않음")
+                            continue
+                            
+                    else:  # exact
+                        # 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후
+                        outbound_hour = config['outbound_exact_hour']
+                        inbound_hour = config['inbound_exact_hour']
+                        
+                        # 가는 편: 설정 시각 이전
+                        outbound_limit = time(hour=outbound_hour, minute=0)
+                        if dep_t > outbound_limit:
+                            logger.debug(f"가는 편 시각 미매칭: {dep_t} > {outbound_limit}")
+                            continue
+                        
+                        # 오는 편: 설정 시각 이후
+                        inbound_limit = time(hour=inbound_hour, minute=0)
+                        if ret_t < inbound_limit:
+                            logger.debug(f"오는 편 시각 미매칭: {ret_t} < {inbound_limit}")
+                            continue
                     
-                    if is_valid_outbound and is_valid_inbound:
-                        if restricted_price is None or price < restricted_price:
-                            restricted_price = price
-                            restricted_info = (
-                                f"가는 편: {dep_departure} → {dep_arrival}\n"
-                                f"오는 편: {ret_departure} → {ret_arrival}\n"
-                                f"왕복 가격: {price:,}원"
-                            )
+                    # 시간 제한을 모두 통과한 경우에만 최저가 갱신
+                    if restricted_price is None or price < restricted_price:
+                        restricted_price = price
+                        restricted_info = (
+                            f"가는 편: {dep_departure} → {dep_arrival}\n"
+                            f"오는 편: {ret_departure} → {ret_arrival}\n"
+                            f"왕복 가격: {price:,}원"
+                        )
+                        logger.info(f"조건부 최저가 갱신: {price:,}원")
                 
                 if not found_any_price:
+                    logger.warning("NO_PRICES: 매칭되는 항공권이 없음")
                     raise Exception("NO_PRICES")
                     
                 return restricted_price, restricted_info, overall_price, overall_info, url
             finally:
                 driver.quit()
         except Exception as ex:
+            last_error = str(ex)
             logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패: {ex}")
             if attempt == max_retries - 1:
-                if str(ex) in ["NO_ITEMS", "NO_PRICES"]:
+                if "NO_PRICES" in str(ex):
+                    raise Exception("조건에 맞는 항공권을 찾을 수 없습니다")
+                elif "NO_ITEMS" in str(ex):
                     raise Exception("항공권 정보를 찾을 수 없습니다")
                 logger.exception(f"fetch_prices 최종 실패: {ex}")
                 raise Exception(f"항공권 조회 중 오류가 발생했습니다: {ex}")
@@ -886,7 +945,16 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         loop = asyncio.get_running_loop()
-        restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, outbound_dep, outbound_arr, outbound_date, inbound_date, user_id)
+        restricted, r_info, overall, o_info, link = await loop.run_in_executor(
+            None, 
+            fetch_prices,
+            outbound_dep,    # 출발 공항
+            outbound_arr,    # 도착 공항
+            outbound_date,   # 가는 날짜
+            inbound_date,    # 오는 날짜
+            3,              # max_retries
+            user_id         # user_id
+        )
         
         # 가격이 모두 None인 경우도 오류로 처리
         if restricted is None and overall is None:
@@ -994,7 +1062,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
-    chat_id = data['chat_id']
+    user_id = data['chat_id']  # chat_id를 user_id로 사용
     outbound_dep, outbound_arr, outbound_date, inbound_date = data['settings']
     hist_path = Path(data['hist_path'])
     logger.info(f"monitor_job 실행: {outbound_dep}->{outbound_arr}, 히스토리 파일: {hist_path.name}")
@@ -1003,65 +1071,97 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     old_restr = state.get("restricted", 0)
     old_overall = state.get("overall", 0)
 
-    loop = asyncio.get_running_loop()
-    restricted, r_info, overall, o_info, link = await loop.run_in_executor(None, fetch_prices, outbound_dep, outbound_arr, outbound_date, inbound_date, chat_id)
+    try:
+        loop = asyncio.get_running_loop()
+        restricted, r_info, overall, o_info, link = await loop.run_in_executor(
+            None, 
+            fetch_prices,
+            outbound_dep,    # 출발 공항
+            outbound_arr,    # 도착 공항
+            outbound_date,   # 가는 날짜
+            inbound_date,    # 오는 날짜
+            3,              # max_retries
+            user_id         # user_id
+        )
 
-    # 공항 정보 가져오기
-    _, dep_city, _ = get_airport_info(outbound_dep)
-    _, arr_city, _ = get_airport_info(outbound_arr)
+        # 공항 정보 가져오기
+        _, dep_city, _ = get_airport_info(outbound_dep)
+        _, arr_city, _ = get_airport_info(outbound_arr)
+        dep_city = dep_city or outbound_dep
+        arr_city = arr_city or outbound_arr
 
-    notify = False
-    msg_lines = []
-    
-    if restricted and restricted < old_restr:
-        notify = True
-        msg_lines.extend([
-            f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*",
-            "",
-            "🎯 *시간 제한 적용 최저가*",
-            f"💰 {old_restr:,}원 → *{restricted:,}원* (-{old_restr - restricted:,}원)",
-            r_info
-        ])
-        logger.info(f"시간 제한 적용 최저가 하락: {old_restr} → {restricted}")
+        notify = False
+        msg_lines = []
         
-    if overall and overall < old_overall:
-        notify = True
-        if not msg_lines:  # 첫 번째 알림인 경우
+        if restricted and restricted < old_restr:
+            notify = True
             msg_lines.extend([
                 f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*",
-                ""
+                "",
+                "🎯 *시간 제한 적용 최저가*",
+                f"💰 {old_restr:,}원 → *{restricted:,}원* (-{old_restr - restricted:,}원)",
+                r_info
             ])
-        msg_lines.extend([
-            "",
-            "📌 *전체 최저가*",
-            f"💰 {old_overall:,}원 → *{overall:,}원* (-{old_overall - overall:,}원)",
-            o_info
-        ])
-        logger.info(f"전체 최저가 하락: {old_overall} → {overall}")
+            logger.info(f"시간 제한 적용 최저가 하락: {old_restr} → {restricted}")
+            
+        if overall and overall < old_overall:
+            notify = True
+            if not msg_lines:  # 첫 번째 알림인 경우
+                msg_lines.extend([
+                    f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*",
+                    ""
+                ])
+            msg_lines.extend([
+                "",
+                "📌 *전체 최저가*",
+                f"💰 {old_overall:,}원 → *{overall:,}원* (-{old_overall - overall:,}원)",
+                o_info
+            ])
+            logger.info(f"전체 최저가 하락: {old_overall} → {overall}")
 
-    if notify:
-        msg_lines.extend([
-            "",
-            f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-            "🔗 네이버 항공권:",
-            link
-        ])
-        await context.bot.send_message(
-            chat_id,
-            "\n".join(msg_lines),
-            parse_mode="Markdown"
-        )
-        logger.info("가격 하락 알림 전송 완료")
+        if notify:
+            msg_lines.extend([
+                "",
+                f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
+                "🔗 네이버 항공권:",
+                link
+            ])
+            await context.bot.send_message(
+                user_id,
+                "\n".join(msg_lines),
+                parse_mode="Markdown"
+            )
+            logger.info("가격 하락 알림 전송 완료")
+
+    except Exception as ex:
+        error_msg = str(ex)
+        if "조건에 맞는 항공권을 찾을 수 없습니다" in error_msg:
+            msg_lines = [
+                f"ℹ️ *{dep_city} ↔ {arr_city} 항공권 알림*",
+                "",
+                "현재 설정하신 시간 조건에 맞는 항공권이 없습니다.",
+                "시간 설정을 변경하시려면 /settings 명령어를 사용해주세요.",
+                "",
+                f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
+                "🔗 네이버 항공권:",
+                link
+            ]
+            await context.bot.send_message(
+                user_id,
+                "\n".join(msg_lines),
+                parse_mode="Markdown"
+            )
+        logger.error(f"monitor_job 실행 중 오류 발생: {ex}")
 
     new_state = {
         "start_time": state.get("start_time"),
         "restricted": restricted or old_restr,
         "overall": overall or old_overall,
         "last_fetch": format_datetime(datetime.now()),
-        "outbound_before": format_time_range(get_user_config(chat_id), 'outbound'),
-        "outbound_after": format_time_range(get_user_config(chat_id), 'outbound'),
-        "inbound_before": format_time_range(get_user_config(chat_id), 'inbound'),
-        "inbound_after": format_time_range(get_user_config(chat_id), 'inbound')
+        "outbound_before": format_time_range(get_user_config(user_id), 'outbound'),
+        "outbound_after": format_time_range(get_user_config(user_id), 'outbound'),
+        "inbound_before": format_time_range(get_user_config(user_id), 'inbound'),
+        "inbound_after": format_time_range(get_user_config(user_id), 'inbound')
     }
     hist_path.write_text(json.dumps(new_state), encoding='utf-8')
     logger.debug("상태 파일 업데이트 완료")
