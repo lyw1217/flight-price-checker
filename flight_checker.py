@@ -7,7 +7,8 @@
 - ADMIN_IDS         : 관리자 ID 목록 (쉼표 구분)
 - USER_AGENT        : (선택) Selenium 헤드리스 브라우저용 User-Agent
 - MAX_MONITORS      : (선택) 사용자당 최대 모니터링 개수 (기본 3)
-- DATA_RETENTION_DAYS: (선택) 데이터 보관 기간 (일, 기본 30)
+- DATA_RETENTION_DAYS: (선택) 모니터링 데이터 보관 기간 (일, 기본 30)
+- CONFIG_RETENTION_DAYS: (선택) 사용자 설정 파일 보관 기간 (일, 기본 7)
 """
 import os
 import re
@@ -21,6 +22,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from collections import defaultdict
+from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
@@ -298,8 +300,96 @@ PATTERN = re.compile(
 def format_datetime(dt: datetime) -> str:
     return dt.astimezone(KST).strftime('%Y-%m-%d %H:%M:%S')
 
-# 항공권 조회 로직
+def setup_selenium_driver():
+    """Selenium WebDriver 설정"""
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(f"user-agent={USER_AGENT}")
+    return webdriver.Remote(
+        command_executor=SELENIUM_HUB_URL,
+        options=options
+    )
+
+def parse_flight_info(text: str, depart: str, arrive: str) -> tuple[str, str, str, str, int] | None:
+    """항공편 정보 파싱
+    Returns:
+        tuple[str, str, str, str, int] | None: (출발시각, 도착시각, 귀국출발시각, 귀국도착시각, 가격)
+    """
+    # 가는 편: 출발지에서 도착지로 가는 항공편
+    m_dep = re.search(rf'(\d{{2}}:\d{{2}}){depart}\s+(\d{{2}}:\d{{2}}){arrive}', text, re.IGNORECASE)
+    if not m_dep:
+        return None
+        
+    # 오는 편: 도착지에서 출발지로 오는 항공편
+    m_ret = re.search(rf'(\d{{2}}:\d{{2}}){arrive}\s+(\d{{2}}:\d{{2}}){depart}', text, re.IGNORECASE)
+    if not m_ret:
+        return None
+        
+    # 가격 정보
+    m_price = re.search(r'왕복\s*([\d,]+)원', text)
+    if not m_price:
+        return None
+        
+    price = int(m_price.group(1).replace(",", ""))
+    return (
+        m_dep.group(1),  # 출발시각
+        m_dep.group(2),  # 도착시각
+        m_ret.group(1),  # 귀국출발시각
+        m_ret.group(2),  # 귀국도착시각
+        price           # 가격
+    )
+
+def check_time_restrictions(dep_time: str, ret_time: str, config: dict) -> bool:
+    """시간 제한 조건 체크
+    Returns:
+        bool: 시간 제한 조건 만족 여부
+    """
+    dep_t = datetime.strptime(dep_time, "%H:%M").time()
+    ret_t = datetime.strptime(ret_time, "%H:%M").time()
+    
+    if config['time_type'] == 'time_period':
+        # 시간대 설정: 선택된 시간대 중 하나라도 포함되면 유효
+        outbound_periods = config['outbound_periods']
+        inbound_periods = config['inbound_periods']
+        
+        # 가는 편: 선택된 시간대 중 하나라도 포함되면 유효
+        is_valid_outbound = any(
+            period_start <= dep_t.hour < period_end
+            for period in outbound_periods
+            for period_start, period_end in [TIME_PERIODS[period]]
+        )
+        if not is_valid_outbound:
+            logger.debug(f"가는 편 시간대 미매칭: {dep_t}는 선택된 시간대 {outbound_periods}에 포함되지 않음")
+            return False
+            
+        # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
+        is_valid_inbound = any(
+            period_start <= ret_t.hour < period_end
+            for period in inbound_periods
+            for period_start, period_end in [TIME_PERIODS[period]]
+        )
+        if not is_valid_inbound:
+            logger.debug(f"오는 편 시간대 미매칭: {ret_t}는 선택된 시간대 {inbound_periods}에 포함되지 않음")
+            return False
+            
+    else:  # exact
+        # 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후
+        outbound_limit = time(hour=config['outbound_exact_hour'], minute=0)
+        if dep_t > outbound_limit:
+            logger.debug(f"가는 편 시각 미매칭: {dep_t} > {outbound_limit}")
+            return False
+            
+        inbound_limit = time(hour=config['inbound_exact_hour'], minute=0)
+        if ret_t < inbound_limit:
+            logger.debug(f"오는 편 시각 미매칭: {ret_t} < {inbound_limit}")
+            return False
+            
+    return True
+
 def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries=3, user_id=None):
+    """항공권 가격 조회"""
     logger.info(f"fetch_prices 호출: {depart}->{arrive} {d_date}~{r_date}")
     url = (
         f"https://flight.naver.com/flights/international/"
@@ -307,32 +397,18 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
     )
     
     # 사용자 설정 가져오기
-    if user_id:
-        config = get_user_config(user_id)
-    else:
-        # 기본값 사용
-        config = DEFAULT_USER_CONFIG.copy()
-        
-    outbound_start, outbound_end = get_time_range(config, 'outbound')
-    inbound_start, inbound_end = get_time_range(config, 'inbound')
+    config = get_user_config(user_id) if user_id else DEFAULT_USER_CONFIG.copy()
     
     last_error = None
     for attempt in range(max_retries):
         try:
-            options = Options()
-            options.add_argument("--headless")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument(f"user-agent={USER_AGENT}")
-            driver = webdriver.Remote(
-                command_executor=SELENIUM_HUB_URL,
-                options=options
-            )
-
+            driver = setup_selenium_driver()
+            
             overall_price = None
             overall_info = ""
             restricted_price = None
             restricted_info = ""
+            
             try:
                 driver.get(url)
                 logger.debug("페이지 로드 완료, 필터 대기 중...")
@@ -356,45 +432,16 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                     if "경유" in text:
                         logger.debug("경유 항공편 제외")
                         continue
-
-                    # 가는 편: 출발지에서 도착지로 가는 항공편
-                    # 예: ICN 07:00 → 09:00 FUK
-                    m_dep = re.search(rf'(\d{{2}}:\d{{2}}){depart}\s+(\d{{2}}:\d{{2}}){arrive}', text, re.IGNORECASE)
-                    if m_dep:
-                        logger.debug(f"가는 편 매칭: 출발={m_dep.group(1)}, 도착={m_dep.group(2)}")
-                    else:
-                        logger.debug("가는 편 매칭 실패")
+                        
+                    # 항공편 정보 파싱
+                    flight_info = parse_flight_info(text, depart, arrive)
+                    if not flight_info:
                         continue
-
-                    # 오는 편: 도착지에서 출발지로 오는 항공편
-                    # 예: FUK 15:00 → 17:00 ICN
-                    m_ret = re.search(rf'(\d{{2}}:\d{{2}}){arrive}\s+(\d{{2}}:\d{{2}}){depart}', text, re.IGNORECASE)
-                    if m_ret:
-                        logger.debug(f"오는 편 매칭: 출발={m_ret.group(1)}, 도착={m_ret.group(2)}")
-                    else:
-                        logger.debug("오는 편 매칭 실패")
-                        continue
-
-                    # 가격 정보
-                    # 예: 왕복 374,524원
-                    m_price = re.search(r'왕복\s*([\d,]+)원', text)
-                    if m_price:
-                        logger.debug(f"가격 매칭: {m_price.group(1)}원")
-                    else:
-                        logger.debug("가격 매칭 실패")
-                        continue
-                    
+                        
+                    dep_departure, dep_arrival, ret_departure, ret_arrival, price = flight_info
                     found_any_price = True
-                    price = int(m_price.group(1).replace(",", ""))
                     
-                    # 가는 편 출발/도착 시각
-                    dep_departure = m_dep.group(1)  # 출발 시각
-                    dep_arrival = m_dep.group(2)    # 도착 시각
-                    
-                    # 오는 편 출발/도착 시각
-                    ret_departure = m_ret.group(1)  # 출발 시각
-                    ret_arrival = m_ret.group(2)    # 도착 시각
-                    
+                    # 전체 최저가 갱신
                     if overall_price is None or price < overall_price:
                         overall_price = price
                         overall_info = (
@@ -404,75 +451,26 @@ def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries
                         )
                         logger.debug(f"전체 최저가 갱신: {price:,}원")
                     
-                    # 시간 제한 적용
-                    dep_t = datetime.strptime(dep_departure, "%H:%M").time()  # 가는 편 출발 시각
-                    ret_t = datetime.strptime(ret_departure, "%H:%M").time()  # 오는 편 출발 시각
-                    
-                    # 시간대 또는 시각 제한 체크
-                    if config['time_type'] == 'time_period':
-                        # 시간대 설정: 선택된 시간대 중 하나라도 포함되면 유효
-                        outbound_periods = config['outbound_periods']
-                        inbound_periods = config['inbound_periods']
-                        
-                        # 가는 편: 선택된 시간대 중 하나라도 포함되면 유효
-                        is_valid_outbound = False
-                        for period in outbound_periods:
-                            period_start, period_end = TIME_PERIODS[period]
-                            if period_start <= dep_t.hour < period_end:  # 시간 단위로 비교
-                                is_valid_outbound = True
-                                logger.debug(f"가는 편 시간대 매칭: {period} ({period_start}:00 <= {dep_t} < {period_end}:00)")
-                                break
-                        
-                        # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
-                        is_valid_inbound = False
-                        for period in inbound_periods:
-                            period_start, period_end = TIME_PERIODS[period]
-                            if period_start <= ret_t.hour < period_end:  # 시간 단위로 비교
-                                is_valid_inbound = True
-                                logger.debug(f"오는 편 시간대 매칭: {period} ({period_start}:00 <= {ret_t} < {period_end}:00)")
-                                break
-                        
-                        if not is_valid_outbound:
-                            logger.debug(f"가는 편 시간대 미매칭: {dep_t}는 선택된 시간대 {outbound_periods}에 포함되지 않음")
-                            continue
-                        if not is_valid_inbound:
-                            logger.debug(f"오는 편 시간대 미매칭: {ret_t}는 선택된 시간대 {inbound_periods}에 포함되지 않음")
-                            continue
-                            
-                    else:  # exact
-                        # 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후
-                        outbound_hour = config['outbound_exact_hour']
-                        inbound_hour = config['inbound_exact_hour']
-                        
-                        # 가는 편: 설정 시각 이전
-                        outbound_limit = time(hour=outbound_hour, minute=0)
-                        if dep_t > outbound_limit:
-                            logger.debug(f"가는 편 시각 미매칭: {dep_t} > {outbound_limit}")
-                            continue
-                        
-                        # 오는 편: 설정 시각 이후
-                        inbound_limit = time(hour=inbound_hour, minute=0)
-                        if ret_t < inbound_limit:
-                            logger.debug(f"오는 편 시각 미매칭: {ret_t} < {inbound_limit}")
-                            continue
-                    
-                    # 시간 제한을 모두 통과한 경우에만 최저가 갱신
-                    if restricted_price is None or price < restricted_price:
-                        restricted_price = price
-                        restricted_info = (
-                            f"가는 편: {dep_departure} → {dep_arrival}\n"
-                            f"오는 편: {ret_departure} → {ret_arrival}\n"
-                            f"왕복 가격: {price:,}원"
-                        )
-                        logger.info(f"조건부 최저가 갱신: {price:,}원")
+                    # 시간 제한 체크
+                    if check_time_restrictions(dep_departure, ret_departure, config):
+                        if restricted_price is None or price < restricted_price:
+                            restricted_price = price
+                            restricted_info = (
+                                f"가는 편: {dep_departure} → {dep_arrival}\n"
+                                f"오는 편: {ret_departure} → {ret_arrival}\n"
+                                f"왕복 가격: {price:,}원"
+                            )
+                            logger.info(f"조건부 최저가 갱신: {price:,}원")
                 
                 if not found_any_price:
                     logger.warning("NO_PRICES: 매칭되는 항공권이 없음")
                     raise Exception("NO_PRICES")
                     
                 return restricted_price, restricted_info, overall_price, overall_info, url
+                
             finally:
                 driver.quit()
+                
         except Exception as ex:
             last_error = str(ex)
             logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패: {ex}")
@@ -550,7 +548,21 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-# 환경변수 검증
+def validate_url(url: str) -> tuple[bool, str]:
+    """URL 유효성 검사
+    Returns:
+        tuple[bool, str]: (유효성 여부, 오류 메시지)
+    """
+    try:
+        result = urlparse(url)
+        if not all([result.scheme, result.netloc]):
+            return False, "URL 형식이 올바르지 않습니다"
+        if result.scheme not in ["http", "https"]:
+            return False, "URL은 http 또는 https로 시작해야 합니다"
+        return True, ""
+    except Exception:
+        return False, "URL 파싱 중 오류가 발생했습니다"
+
 def validate_env_vars() -> list[str]:
     """환경변수 검증
     Returns:
@@ -564,23 +576,29 @@ def validate_env_vars() -> list[str]:
         
     # Selenium Hub URL 검증
     selenium_url = os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub")
-    if not selenium_url.startswith(("http://", "https://")):
-        errors.append("SELENIUM_HUB_URL이 올바른 URL 형식이 아닙니다")
+    is_valid, error_msg = validate_url(selenium_url)
+    if not is_valid:
+        errors.append(f"SELENIUM_HUB_URL이 올바르지 않습니다: {error_msg}")
+        
+    # 관리자 ID 검증
+    admin_ids = os.getenv("ADMIN_IDS", "")
+    if admin_ids:
+        for admin_id in admin_ids.split(","):
+            if admin_id.strip() and not admin_id.strip().isdigit():
+                errors.append(f"ADMIN_IDS에 올바르지 않은 ID가 포함되어 있습니다: {admin_id}")
         
     # 숫자형 환경변수 검증
-    try:
-        max_monitors = int(os.getenv("MAX_MONITORS", "3"))
-        if max_monitors < 1:
-            errors.append("MAX_MONITORS는 1 이상이어야 합니다")
-    except ValueError:
-        errors.append("MAX_MONITORS가 올바른 숫자가 아닙니다")
-        
-    try:
-        retention_days = int(os.getenv("DATA_RETENTION_DAYS", "30"))
-        if retention_days < 1:
-            errors.append("DATA_RETENTION_DAYS는 1 이상이어야 합니다")
-    except ValueError:
-        errors.append("DATA_RETENTION_DAYS가 올바른 숫자가 아닙니다")
+    for var_name, default, min_val in [
+        ("MAX_MONITORS", "3", 1),
+        ("DATA_RETENTION_DAYS", "30", 1),
+        ("CONFIG_RETENTION_DAYS", "7", 1)
+    ]:
+        try:
+            value = int(os.getenv(var_name, default))
+            if value < min_val:
+                errors.append(f"{var_name}는 {min_val} 이상이어야 합니다")
+        except ValueError:
+            errors.append(f"{var_name}가 올바른 숫자가 아닙니다")
         
     return errors
 
@@ -869,8 +887,8 @@ def valid_airport(code: str) -> tuple[bool, str]:
 
 async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().split()
-    logger.debug(f"monitor_setting 입력: {text}")
-    if len_text := len(text) != 4:
+    len_text = len(text)
+    if len_text != 4:
         logger.warning("monitor_setting: 형식 오류")
         await update.message.reply_text(
             "❗ 형식 오류\n"
@@ -1442,13 +1460,42 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
         return
 
+    # 확인 버튼이 있는 인라인 키보드 생성
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ 예, 모두 취소합니다", callback_data="confirm_allcancel"),
+            InlineKeyboardButton("❌ 아니오", callback_data="cancel_allcancel")
+        ]
+    ]
+
+    await update.message.reply_text(
+        f"⚠️ *주의*: 정말 모든 모니터링({len(files)}건)을 취소하시겠습니까?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await query.answer("❌ 관리자 권한이 필요합니다.")
+        return
+        
+    if query.data == "cancel_allcancel":
+        await query.message.edit_text("모니터링 취소가 취소되었습니다.")
+        return
+        
+    if query.data != "confirm_allcancel":
+        return
+
+    files = list(DATA_DIR.glob("price_*.json"))
     count = 0
     error_count = 0
     processed_users = set()
 
     for hist_path in files:
         try:
-            # 파일명에서 사용자 ID 추출
             m = PATTERN.fullmatch(hist_path.name)
             if not m:
                 continue
@@ -1456,18 +1503,15 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             uid = int(m.group("uid"))
             processed_users.add(uid)
 
-            # 파일 삭제
             try:
                 hist_path.unlink()
                 count += 1
             except FileNotFoundError:
-                # 이미 삭제된 경우
                 pass
             except Exception as e:
                 error_count += 1
                 logger.error(f"파일 삭제 중 오류 발생 ({hist_path.name}): {e}")
 
-            # 관련 작업 중지
             for job in ctx.application.job_queue.get_jobs_by_name(str(hist_path)):
                 job.schedule_removal()
 
@@ -1475,17 +1519,15 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             error_count += 1
             logger.error(f"모니터링 취소 중 오류 발생: {e}")
 
-    # 메모리 상의 monitors 딕셔너리도 정리
     monitors = ctx.application.bot_data.get("monitors", {})
     for uid in processed_users:
         monitors.pop(uid, None)
 
-    # 결과 메시지 생성
     msg_parts = [f"✅ 전체 모니터링 종료: {count}건 처리됨"]
     if error_count > 0:
         msg_parts.append(f"⚠️ {error_count}건의 오류 발생")
     
-    await update.message.reply_text("\n".join(msg_parts))
+    await query.message.edit_text("\n".join(msg_parts))
     logger.info(f"전체 모니터링 종료: {count}건 처리됨, {error_count}건의 오류")
 
 async def on_startup(app):
@@ -1599,9 +1641,12 @@ def load_json_data(file_path: Path) -> dict:
 async def cleanup_old_data():
     """오래된 모니터링 데이터와 설정 파일 정리"""
     retention_days = int(os.getenv("DATA_RETENTION_DAYS", "30"))
-    config_retention_days = 7  # 설정 파일 보관 기간
+    config_retention_days = int(os.getenv("CONFIG_RETENTION_DAYS", "7"))
     cutoff_date = datetime.now(KST) - timedelta(days=retention_days)
     config_cutoff_date = datetime.now(KST) - timedelta(days=config_retention_days)
+    
+    monitor_deleted = 0
+    config_deleted = 0
     
     # 오래된 모니터링 데이터 정리
     for file_path in DATA_DIR.glob("price_*.json"):
@@ -1614,6 +1659,7 @@ async def cleanup_old_data():
             if start_time < cutoff_date:
                 logger.info(f"오래된 데이터 삭제: {file_path.name}")
                 file_path.unlink()
+                monitor_deleted += 1
         except Exception as ex:
             logger.warning(f"데이터 정리 중 오류 발생: {ex}")
     
@@ -1627,7 +1673,7 @@ async def cleanup_old_data():
                     '%Y-%m-%d %H:%M:%S'
                 ).replace(tzinfo=KST)
                 
-                # 마지막 활동으로부터 일주일이 지났고, 활성화된 모니터링이 없는 경우
+                # 마지막 활동으로부터 설정된 기간이 지났고, 활성화된 모니터링이 없는 경우
                 if last_activity < config_cutoff_date:
                     user_id = int(config_file.stem.split('_')[1])
                     active_monitors = [
@@ -1637,8 +1683,28 @@ async def cleanup_old_data():
                     if not active_monitors:
                         logger.info(f"비활성 사용자 설정 삭제: {config_file.name}")
                         config_file.unlink()
+                        config_deleted += 1
         except Exception as ex:
             logger.warning(f"설정 파일 정리 중 오류 발생: {ex}")
+            
+    # 관리자에게 정리 결과 알림
+    if ADMIN_IDS:
+        msg = (
+            "🧹 *데이터 정리 완료*\n"
+            f"• 삭제된 모니터링: {monitor_deleted}건\n"
+            f"• 삭제된 설정 파일: {config_deleted}건\n\n"
+            f"모니터링 보관 기간: {retention_days}일\n"
+            f"설정 파일 보관 기간: {config_retention_days}일"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=admin_id,
+                    text=msg,
+                    parse_mode="Markdown"
+                )
+            except Exception as ex:
+                logger.error(f"관리자({admin_id})에게 알림 전송 실패: {ex}")
 
 async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """공항 코드 목록 보기"""
@@ -1690,6 +1756,7 @@ def main():
     
     # 콜백 쿼리 핸들러 추가
     application.add_handler(CallbackQueryHandler(cancel_callback))
+    application.add_handler(CallbackQueryHandler(all_cancel_callback, pattern="^(confirm|cancel)_allcancel$"))
     
     # 관리자 명령어
     if ADMIN_IDS:
