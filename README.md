@@ -95,6 +95,38 @@ python -m unittest tests.test_flight_checker.TestFlightChecker.test_valid_date
 - 모니터링 데이터: `/data/price_*.json`
 - 사용자 설정: `/data/user_configs/config_*.json`
 - 로그 파일: `/data/logs/flight_bot.log`
+- 공항 데이터: `/data/airports.json`
+
+### 공항 데이터 관리
+
+공항 정보는 `/data/airports.json` 파일에서 관리됩니다. 파일 형식은 다음과 같습니다:
+
+```json
+{
+    "지역코드": {
+        "name": "지역명",
+        "airports": {
+            "공항코드": ["도시명", "공항명"],
+            ...
+        }
+    }
+}
+```
+
+예시:
+```json
+{
+    "KOR": {
+        "name": "한국",
+        "airports": {
+            "ICN": ["인천", "서울/인천국제공항"],
+            "GMP": ["김포", "서울/김포국제공항"]
+        }
+    }
+}
+```
+
+공항 정보를 수정하거나 추가하려면 이 파일을 직접 편집하면 됩니다. 프로그램은 시작할 때 이 파일을 자동으로 로드합니다.
 
 ## 주의사항
 
