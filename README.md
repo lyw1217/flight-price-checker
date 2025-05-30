@@ -89,6 +89,10 @@ python -m unittest tests.test_flight_checker.TestFlightChecker.test_valid_date
 - 시간 제한 조건 체크
 - 날짜 유효성 검사
 - 공항 코드 유효성 검사
+- 사용자 설정(config) 로드 및 저장 기능
+- 시간 설정 문자열 포맷팅 기능
+- 시간 범위 반환 기능
+- 메시지 매니저 (MessageManager) 기능
 
 ## 데이터 저장
 

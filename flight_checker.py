@@ -358,49 +358,62 @@ async def save_json_data_async(file_path: Path, data: dict):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(file_executor, save_json_data, file_path, data)
 
+async def save_user_config_async(user_id: int, config: dict):
+    """비동기 사용자 설정 저장"""
+    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
+    # last_activity는 호출하는 쪽에서 미리 업데이트하거나, 여기서 업데이트
+    config['last_activity'] = format_datetime(datetime.now())
+    if 'created_at' not in config or not config['created_at']:
+        config['created_at'] = format_datetime(datetime.now())
+    await save_json_data_async(config_file, config)
+
 async def get_user_config_async(user_id: int) -> dict:
     """비동기 사용자 설정 로드"""
-    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    if config_file.exists():
-        try:
-            loop = asyncio.get_running_loop()
-            data = await loop.run_in_executor(file_executor, lambda: get_user_config(user_id))
-            return data
-        except Exception as e:
-            logger.error(f"사용자 설정 로드 중 오류: {e}")
-    
-    default_config = DEFAULT_USER_CONFIG.copy()
-    default_config['created_at'] = format_datetime(datetime.now())
-    default_config['last_activity'] = format_datetime(datetime.now())
-    await loop.run_in_executor(file_executor, lambda: save_user_config(user_id, default_config))
-    return default_config
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(file_executor, get_user_config, user_id)
 
 def get_user_config(user_id: int) -> dict:
-    """사용자 설정을 가져옵니다."""
+    """사용자 설정을 가져옵니다. 파일이 없으면 기본값을 생성하고 저장합니다."""
     config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    if config_file.exists():
-        try:
+    
+    try:
+        if config_file.exists():
             with file_lock(config_file):
                 data = json.loads(config_file.read_text(encoding='utf-8'))
                 # 마지막 활동 시간 업데이트
                 data['last_activity'] = format_datetime(datetime.now())
+                # 변경된 내용을 다시 파일에 씀 (이 부분이 중요)
                 config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
                 return data
-        except Exception as e:
-            logger.error(f"사용자 설정 로드 중 오류: {e}")
-    
-    # 설정 파일이 없으면 기본값으로 생성
+    except Exception as e:
+        logger.error(f"사용자 설정 로드 중 오류 (ID: {user_id}, 파일: {config_file}): {e}")
+        # 오류 발생 시에도 기본 설정으로 복구 시도
+
+    # 설정 파일이 없거나 로드 중 오류 발생 시 기본값으로 생성 및 저장
+    logger.info(f"기본 사용자 설정 생성 (ID: {user_id}, 파일: {config_file})")
     default_config = DEFAULT_USER_CONFIG.copy()
     default_config['created_at'] = format_datetime(datetime.now())
     default_config['last_activity'] = format_datetime(datetime.now())
-    save_user_config(user_id, default_config)
+    
+    try:
+        with file_lock(config_file):
+            config_file.write_text(json.dumps(default_config, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as e_save:
+        logger.error(f"기본 사용자 설정 저장 실패 (ID: {user_id}, 파일: {config_file}): {e_save}")
+        # 저장 실패 시 메모리상의 기본 설정이라도 반환
+
     return default_config
 
 def save_user_config(user_id: int, config: dict):
     """사용자 설정을 저장합니다."""
     config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    with file_lock(config_file):
-        config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+    # last_activity는 호출하는 쪽에서 미리 업데이트하거나, 여기서 업데이트
+    config['last_activity'] = format_datetime(datetime.now())
+    if 'created_at' not in config or not config['created_at']:
+        config['created_at'] = format_datetime(datetime.now())
+    
+    # save_json_data 함수를 사용하여 파일 잠금과 함께 저장
+    save_json_data(config_file, config)
 
 def get_time_range(config: dict, direction: str) -> tuple[time, time]:
     """시간 범위를 반환합니다.
@@ -603,18 +616,6 @@ PATTERN = re.compile(
 
 def format_datetime(dt: datetime) -> str:
     return dt.astimezone(KST).strftime('%Y-%m-%d %H:%M:%S')
-
-def setup_selenium_driver():
-    """Selenium WebDriver 설정"""
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument(f"user-agent={USER_AGENT}")
-    return webdriver.Remote(
-        command_executor=SELENIUM_HUB_URL,
-        options=options
-    )
 
 def parse_flight_info(text: str, depart: str, arrive: str) -> tuple[str, str, str, str, int] | None:
     """항공편 정보 파싱
@@ -1224,104 +1225,6 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
-async def run_fetch_prices(status_message, dep, arr, d_date, r_date, user_id, ctx):
-    final_keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
-
-    try:
-        restricted, r_info, overall, o_info, link = await fetch_prices(dep, arr, d_date, r_date, 3, user_id)
-        if restricted is None and overall is None:
-            raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (결과 없음)")
-        hist_path = DATA_DIR / f"price_{user_id}_{dep}_{arr}_{d_date}_{r_date}.json"
-        user_config = await get_user_config_async(user_id)
-        await save_json_data_async(hist_path, {
-            "start_time": format_datetime(datetime.now()),
-            "restricted": restricted or 0,
-            "overall": overall or 0,
-            "last_fetch": format_datetime(datetime.now()),
-            "time_setting_outbound": format_time_range(user_config, 'outbound'),
-            "time_setting_inbound": format_time_range(user_config, 'inbound')
-        })
-
-        job = ctx.application.job_queue.run_repeating(
-            monitor_job, interval=timedelta(minutes=30), first=timedelta(seconds=0),
-            name=str(hist_path), data={
-                "chat_id": user_id, "settings": (dep, arr, d_date, r_date),
-                "hist_path": str(hist_path)
-            }
-        )
-
-        monitors = ctx.application.bot_data.setdefault("monitors", {})
-        monitors.setdefault(user_id, []).append({
-            "settings": (dep, arr, d_date, r_date),
-            "start_time": datetime.now(KST),
-            "hist_path": str(hist_path),
-            "job": job
-        })
-
-        _, dep_city, dep_airport = get_airport_info(dep)
-        _, arr_city, arr_airport = get_airport_info(arr)
-        dep_city = dep_city or dep
-        arr_city = arr_city or arr
-
-        logger.info(f"모니터링 시작 등록: {hist_path}")
-
-        msg_lines = [
-            f"✅ *{dep_city} ↔ {arr_city} 모니터링 시작*",
-            f"🛫 가는 편: {dep_airport} → {arr_airport}",
-            f"🛬 오는 편: {arr_airport} → {dep_airport}",
-            f"📅 {d_date[:4]}/{d_date[4:6]}/{d_date[6:]} → {r_date[:4]}/{r_date[4:6]}/{r_date[6:]}",
-            "",
-            "⚙️ *적용된 시간 제한*",
-            f"• 가는 편: {format_time_range(user_config, 'outbound')}",
-            f"• 오는 편: {format_time_range(user_config, 'inbound')}",
-            "",
-            "📊 *현재 최저가*"
-        ]
-
-        if restricted:
-            msg_lines.extend(["🎯 *시간 제한 적용 최저가*", r_info, ""])
-        if overall:
-            msg_lines.extend(["📌 *전체 최저가*", o_info])
-            
-        msg_lines.extend([
-            "", "ℹ️ 30분마다 자동으로 가격을 확인하며,", "가격이 하락하면 알림을 보내드립니다.",
-            "", "🔗 네이버 항공권:", link
-        ])
-
-        await status_message.edit_text(
-            "\n".join(msg_lines),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_markup=final_keyboard
-        )
-
-    except NoFlightDataException as e:
-        logger.warning(f"항공권 조회 실패 (데이터 없음, 사용자 {user_id}): {e}")
-        await status_message.edit_text(
-            "❗ 지원하지 않는 공항이거나 해당 경로의 항공편이 없습니다.\n"
-            "💡 주요 공항 코드 목록은 /airport 명령으로 확인하실 수 있습니다.",
-            reply_markup=final_keyboard,
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-    except NoMatchingFlightsException as e:
-        logger.warning(f"항공권 조회 실패 (조건 불일치, 사용자 {user_id}): {e}")
-        await status_message.edit_text(
-             "❗ 현재 설정된 시간 조건에 맞는 항공권을 찾을 수 없습니다.\n"
-             "시간 설정을 변경하시려면 /settings 명령어를 사용해주세요.",
-            reply_markup=final_keyboard,
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-    except Exception as e:
-        logger.error(f"항공권 조회 중 예측하지 못한 오류 (사용자 {user_id}): {e}", exc_info=True)
-        await status_message.edit_text(
-            "❗ 항공권 조회 중 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.",
-            reply_markup=final_keyboard,
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     user_id = data['chat_id']
@@ -1352,16 +1255,17 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     old_overall = state.get("overall", 0)
     restricted, r_info, overall, o_info, link = None, "", None, "", ""
 
+    # 공항 정보 미리 가져오기
+    _, dep_city, _ = get_airport_info(outbound_dep)
+    _, arr_city, _ = get_airport_info(outbound_arr)
+    dep_city = dep_city or outbound_dep
+    arr_city = arr_city or outbound_arr
+
     try:
         restricted, r_info, overall, o_info, link = await fetch_prices(
             outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
         )
         
-        _, dep_city, _ = get_airport_info(outbound_dep)
-        _, arr_city, _ = get_airport_info(outbound_arr)
-        dep_city = dep_city or outbound_dep
-        arr_city = arr_city or outbound_arr
-
         notify_msg_lines = []
         price_change_occurred = False
 
@@ -1406,7 +1310,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         if old_restr != 0 or old_overall != 0:
             naver_link = f"https://flight.naver.com/flights/international/{outbound_dep}-{outbound_arr}-{outbound_date}/{outbound_arr}-{outbound_dep}-{inbound_date}?adult=1&fareType=Y"
             msg_lines = [
-                f"ℹ️ *{dep_city or outbound_dep} ↔ {arr_city or outbound_arr} 항공권 알림*", "",
+                f"ℹ️ *{dep_city} ↔ {arr_city} 항공권 알림*", "",
                 "현재 설정하신 시간 조건에 맞는 항공권이 없습니다.",
                 f"• 가는 편 시간: {format_time_range(user_config, 'outbound')}",
                 f"• 오는 편 시간: {format_time_range(user_config, 'inbound')}",
@@ -2029,44 +1933,49 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
     for config_file in USER_CONFIG_DIR.glob("config_*.json"):
         try:
             # file_lock is already part of load_json_data, but user config has custom load/save
-            with file_lock(config_file):
-                if not config_file.exists(): continue # Might have been deleted by another process/thread
-                
-                data = json.loads(config_file.read_text(encoding='utf-8'))
-                last_activity_str = data.get('last_activity', data.get('created_at'))
+            # Use async load for consistency and proper locking via load_json_data_async -> load_json_data -> file_lock
+            if not config_file.exists(): continue # Might have been deleted
 
-                if not last_activity_str:
-                    logger.warning(f"설정 파일 정리 중 'last_activity' 또는 'created_at' 누락: {config_file.name}, 파일 삭제 시도.")
+            data = await load_json_data_async(config_file) # 비동기 로드 및 잠금
+            last_activity_str = data.get('last_activity', data.get('created_at'))
+
+            if not last_activity_str:
+                logger.warning(f"설정 파일 정리 중 'last_activity' 또는 'created_at' 누락: {config_file.name}, 파일 삭제 시도.")
+                try:
+                    with file_lock(config_file): # 삭제 전 잠금
+                        if config_file.exists(): config_file.unlink()
+                    config_deleted += 1
+                except OSError as e:
+                    logger.error(f"오래된 설정 파일 삭제 실패 '{config_file.name}': {e}")
+                continue
+            
+            last_activity = datetime.strptime(
+                last_activity_str,
+                '%Y-%m-%d %H:%M:%S'
+            ).replace(tzinfo=KST)
+
+            if last_activity < config_cutoff_date:
+                user_id_match = re.search(r"config_(\d+)\.json", config_file.name)
+                if not user_id_match:
+                    logger.warning(f"설정 파일 이름에서 user_id 추출 불가: {config_file.name}")
+                    continue
+                user_id = int(user_id_match.group(1))
+
+                # Check for active monitors for this user
+                loop = asyncio.get_running_loop()
+                active_monitors = await loop.run_in_executor(
+                    file_executor, 
+                    lambda: [p for p in DATA_DIR.glob(f"price_{user_id}_*.json") if p.exists()]
+                )
+
+                if not active_monitors:
+                    logger.info(f"비활성 사용자 설정 삭제: {config_file.name}")
                     try:
-                        config_file.unlink()
+                        with file_lock(config_file): # 삭제 전 잠금
+                            if config_file.exists(): config_file.unlink()
                         config_deleted += 1
                     except OSError as e:
-                        logger.error(f"오래된 설정 파일 삭제 실패 '{config_file.name}': {e}")
-                    continue
-                
-                last_activity = datetime.strptime(
-                    last_activity_str,
-                    '%Y-%m-%d %H:%M:%S'
-                ).replace(tzinfo=KST)
-
-                if last_activity < config_cutoff_date:
-                    user_id_match = re.search(r"config_(\d+)\.json", config_file.name)
-                    if not user_id_match:
-                        logger.warning(f"설정 파일 이름에서 user_id 추출 불가: {config_file.name}")
-                        continue
-                    user_id = int(user_id_match.group(1))
-
-                    active_monitors = [
-                        p for p in DATA_DIR.glob(f"price_{user_id}_*.json")
-                        if p.exists() # Check if monitor file actually exists
-                    ]
-                    if not active_monitors:
-                        logger.info(f"비활성 사용자 설정 삭제: {config_file.name}")
-                        try:
-                            config_file.unlink()
-                            config_deleted += 1
-                        except OSError as e:
-                            logger.error(f"비활성 사용자 설정 파일 삭제 실패 '{config_file.name}': {e}")
+                        logger.error(f"비활성 사용자 설정 파일 삭제 실패 '{config_file.name}': {e}")
         except json.JSONDecodeError:
             logger.warning(f"설정 파일 정리 중 JSON 디코딩 오류: {config_file.name}, 파일 삭제 시도.")
             try:
@@ -2129,7 +2038,7 @@ def main():
         logger.error("환경변수 BOT_TOKEN이 설정되어 있지 않습니다.")
         return
     
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
     
     # 작업 디렉토리 생성
     DATA_DIR.mkdir(parents=True, exist_ok=True)
