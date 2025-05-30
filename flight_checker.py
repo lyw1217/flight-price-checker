@@ -872,6 +872,11 @@ def validate_env_vars() -> list[str]:
         except ValueError:
             errors.append(f"{var_name}가 올바른 숫자가 아닙니다")
         
+    # 로그 레벨 환경변수 검증
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    if log_level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+        errors.append(f"LOG_LEVEL이 올바르지 않습니다: {log_level}. (DEBUG, INFO, WARNING, ERROR, CRITICAL 중 하나여야 합니다)")
+        
     return errors
 
 # 명령어 속도 제한
@@ -1282,7 +1287,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         notify_msg_lines = []
         price_change_occurred = False
 
-        if restricted is not None and old_restr > 0 and restricted < old_restr:
+        if restricted is not None and old_restr > 0 and old_restr - restricted >= 5000:
             price_change_occurred = True
             notify_msg_lines.extend([
                 f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", "",
@@ -1291,7 +1296,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 r_info
             ])
 
-        if overall is not None and old_overall > 0 and overall < old_overall:
+        if overall is not None and old_overall > 0 and old_overall - overall >= 5000:
             if not price_change_occurred:
                  notify_msg_lines.extend([f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", ""])
             price_change_occurred = True
@@ -2039,8 +2044,13 @@ async def cleanup_resources():
 def main():
     # main 함수 시작 부분에 로그 로테이션 및 로깅 설정 추가
     rotate_logs()
+
+    # 로그 레벨 설정
+    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
         handlers=[
             logging.FileHandler(LOG_FILE, encoding="utf-8"),
