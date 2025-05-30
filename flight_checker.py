@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 텔레그램 봇으로 30분마다 항공권 최저가 조회 및 알림 기능 제공
+
 환경변수 설정 (필수):
 - BOT_TOKEN         : Telegram 봇 토큰
 - SELENIUM_HUB_URL  : Selenium Hub 주소 (기본: http://localhost:4444/wd/hub)
-- ADMIN_IDS         : 관리자 ID 목록 (쉼표 구분)
-- USER_AGENT        : (선택) Selenium 헤드리스 브라우저용 User-Agent
-- MAX_MONITORS      : (선택) 사용자당 최대 모니터링 개수 (기본 3)
-- DATA_RETENTION_DAYS: (선택) 모니터링 데이터 보관 기간 (일, 기본 30)
-- CONFIG_RETENTION_DAYS: (선택) 사용자 설정 파일 보관 기간 (일, 기본 7)
-- MAX_WORKERS       : (선택) 최대 동시 작업자 수 (기본 10)
+- ADMIN_IDS         : 관리자 ID 목록 (쉼표로 구분)
+- USER_AGENT        : (선택) Selenium 헤드리스 브라우저용 User-Agent (지정하지 않으면 기본값 사용)
+- MAX_MONITORS      : (선택) 사용자당 최대 모니터링 개수 (기본값: 3)
+- DATA_RETENTION_DAYS: (선택) 모니터링 데이터 보관 기간 (일, 기본값: 30)
+- CONFIG_RETENTION_DAYS: (선택) 사용자 설정 파일 보관 기간 (일, 기본값: 7)
+- MAX_WORKERS       : (선택) Selenium 작업용 최대 동시 실행 브라우저 수 (기본값: 5)
+- FILE_WORKERS      : (선택) 파일 I/O 작업용 최대 동시 작업자 수 (기본값: 5)
 """
 import os
 import re
@@ -174,9 +176,9 @@ class SeleniumManager:
         Selenium 작업을 위한 전용 매니저
         
         Args:
-            max_workers: 동시 실행할 최대 브라우저 수
-            grid_url: Selenium Grid URL
-            user_agent: 브라우저 User-Agent
+            max_workers: 동시 실행할 최대 브라우저 수 (환경 변수 SELENIUM_WORKERS로 설정 가능)
+            grid_url: Selenium Grid URL (환경 변수 SELENIUM_HUB_URL로 설정 가능)
+            user_agent: 브라우저 User-Agent (환경 변수 USER_AGENT로 설정 가능)
         """
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="selenium")
         self.grid_url = grid_url
@@ -315,7 +317,13 @@ FILE_WORKERS = int(os.getenv("FILE_WORKERS", "5"))
 file_executor = ThreadPoolExecutor(max_workers=FILE_WORKERS, thread_name_prefix="file")
 
 # --- 설정 및 초기화 ---
-DATA_DIR = Path("/data")
+# 테스트 환경에서는 FLIGHT_CHECKER_TEST_DATA_DIR 환경 변수를 사용하여 DATA_DIR 경로를 오버라이드할 수 있음
+data_dir_path_str = os.getenv("FLIGHT_CHECKER_TEST_DATA_DIR")
+if data_dir_path_str:
+    DATA_DIR = Path(data_dir_path_str)
+else:
+    DATA_DIR = Path("/data")
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_DIR = DATA_DIR / "logs"
@@ -325,6 +333,9 @@ LOG_FILE = LOG_DIR / "flight_bot.log"
 # 사용자 설정 디렉토리
 USER_CONFIG_DIR = DATA_DIR / "user_configs"
 USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+# 공항 데이터 파일 경로 (테스트 시 패치 가능하도록 변수화)
+AIRPORTS_JSON_PATH = Path(__file__).resolve().parent / "data" / "airports.json"
 
 # 시간대 설정
 TIME_PERIODS = {
@@ -368,12 +379,16 @@ async def save_user_config_async(user_id: int, config: dict):
     await save_json_data_async(config_file, config)
 
 async def get_user_config_async(user_id: int) -> dict:
-    """비동기 사용자 설정 로드"""
+    """비동기 사용자 설정 로드. 내부적으로 동기 함수 get_user_config 호출."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(file_executor, get_user_config, user_id)
 
 def get_user_config(user_id: int) -> dict:
-    """사용자 설정을 가져옵니다. 파일이 없으면 기본값을 생성하고 저장합니다."""
+    """사용자 설정을 로드하거나 기본값을 생성하여 반환합니다.
+    
+    설정 파일이 존재하면 로드하고, last_activity를 현재 시간으로 갱신 후 저장합니다.
+    파일이 없거나 오류 발생 시 기본 설정을 생성하고 저장합니다.
+    """
     config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
     
     try:
@@ -382,12 +397,12 @@ def get_user_config(user_id: int) -> dict:
                 data = json.loads(config_file.read_text(encoding='utf-8'))
                 # 마지막 활동 시간 업데이트
                 data['last_activity'] = format_datetime(datetime.now())
-                # 변경된 내용을 다시 파일에 씀 (이 부분이 중요)
+                # 변경된 내용을 다시 파일에 씀
                 config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
                 return data
     except Exception as e:
         logger.error(f"사용자 설정 로드 중 오류 (ID: {user_id}, 파일: {config_file}): {e}")
-        # 오류 발생 시에도 기본 설정으로 복구 시도
+        # 오류 발생 시에도 기본 설정으로 복구 시도 (아래 로직에서 처리)
 
     # 설정 파일이 없거나 로드 중 오류 발생 시 기본값으로 생성 및 저장
     logger.info(f"기본 사용자 설정 생성 (ID: {user_id}, 파일: {config_file})")
@@ -396,6 +411,7 @@ def get_user_config(user_id: int) -> dict:
     default_config['last_activity'] = format_datetime(datetime.now())
     
     try:
+        # save_user_config 함수를 사용하지 않고 직접 저장 (순환 호출 방지 및 로직 명확화)
         with file_lock(config_file):
             config_file.write_text(json.dumps(default_config, ensure_ascii=False, indent=2), encoding='utf-8')
     except Exception as e_save:
@@ -405,15 +421,16 @@ def get_user_config(user_id: int) -> dict:
     return default_config
 
 def save_user_config(user_id: int, config: dict):
-    """사용자 설정을 저장합니다."""
+    """사용자 설정을 저장합니다.
+    
+    last_activity와 created_at (없는 경우)을 현재 시간으로 설정 후 저장합니다.
+    """
     config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    # last_activity는 호출하는 쪽에서 미리 업데이트하거나, 여기서 업데이트
     config['last_activity'] = format_datetime(datetime.now())
     if 'created_at' not in config or not config['created_at']:
         config['created_at'] = format_datetime(datetime.now())
     
-    # save_json_data 함수를 사용하여 파일 잠금과 함께 저장
-    save_json_data(config_file, config)
+    save_json_data(config_file, config) # 파일 잠금과 함께 저장
 
 def get_time_range(config: dict, direction: str) -> tuple[time, time]:
     """시간 범위를 반환합니다.
@@ -578,15 +595,10 @@ def rotate_logs():
     if LOG_FILE.exists():
         LOG_FILE.rename(LOG_FILE.with_suffix('.log.1'))
 
-rotate_logs()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
+# logging.basicConfig(...) # 여기서 로깅 설정 제거
+# rotate_logs() # 여기서 호출 제거
+
+# 로거 인스턴스는 모듈 레벨에서 생성 유지
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -963,10 +975,10 @@ def valid_date(d: str) -> tuple[bool, str]:
 # 공항 코드 유효성 검사
 def load_airports():
     """공항 데이터 로드"""
-    airports_file = Path("/app/data/airports.json")
+    airports_file = AIRPORTS_JSON_PATH
     if not airports_file.exists():
-        logger.error("공항 데이터 파일이 없습니다: airports.json")
-        raise FileNotFoundError("airports.json 파일을 찾을 수 없습니다")
+        logger.error(f"공항 데이터 파일이 없습니다: {airports_file.name}")
+        raise FileNotFoundError(f"{airports_file.name} 파일을 찾을 수 없습니다")
         
     try:
         with open(airports_file, 'r', encoding='utf-8') as f:
@@ -1226,6 +1238,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """등록된 모니터링 작업을 주기적으로 실행하여 항공권 가격 변동을 확인하고 알림을 전송합니다."""
     data = context.job.data
     user_id = data['chat_id']
     outbound_dep, outbound_arr, outbound_date, inbound_date = data['settings']
@@ -1384,8 +1397,8 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             dep, arr = info['dep'], info['arr']
             _, dep_city, _ = get_airport_info(dep)
             _, arr_city, _ = get_airport_info(arr)
-            dep_city = dep_city or dep
-            arr_city = arr_city or arr
+            dep_city = dep_city or dep # 도시 정보가 없으면 공항 코드로 대체
+            arr_city = arr_city or arr # 도시 정보가 없으면 공항 코드로 대체
             
             dd, rd = info['dd'], info['rd']
             dd_fmt = f"{dd[2:4]}.{dd[4:6]}.{dd[6:]}"
@@ -1491,6 +1504,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """모니터링 취소 요청(인라인 버튼 콜백)을 처리합니다."""
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
@@ -1581,8 +1595,13 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
 
-    # 모든 모니터링 파일 찾기
-    files = sorted(DATA_DIR.glob("price_*.json"))
+    # 모든 모니터링 파일 찾기 (비동기적으로)
+    loop = asyncio.get_running_loop()
+    files = await loop.run_in_executor(
+        file_executor,
+        lambda: sorted(DATA_DIR.glob("price_*.json"))
+    )
+
     if not files:
         await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
         return
@@ -1627,8 +1646,13 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
 
-    # 모든 모니터링 파일 찾기
-    files = list(DATA_DIR.glob("price_*.json"))
+    # 모든 모니터링 파일 찾기 (비동기적으로)
+    loop = asyncio.get_running_loop()
+    files = await loop.run_in_executor(
+        file_executor,
+        lambda: list(DATA_DIR.glob("price_*.json"))
+    )
+
     if not files:
         await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
         return
@@ -1648,6 +1672,7 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """전체 모니터링 취소 요청(인라인 버튼 콜백)을 처리합니다."""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -1726,7 +1751,7 @@ async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_startup(app: ApplicationBuilder): # Type hint for app
     now = datetime.now(KST)
     monitors = app.bot_data.setdefault("monitors", {})
-    logger.info("봇 시작 시 on_startup 실행: 기존 모니터링 복원 시작")
+    logger.info("봇 시작: 기존 모니터링 작업 복원 중...")
 
     processed_files = 0
     active_jobs_restored = 0
@@ -1734,40 +1759,36 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
     for hist_path in DATA_DIR.glob("price_*.json"):
         processed_files += 1
         try:
-            logger.debug(f"모니터링 파일 처리 중: {hist_path.name}")
+            # logger.debug(f"모니터링 파일 처리 중: {hist_path.name}") # 상세 로그는 필요시 활성화
             m = PATTERN.fullmatch(hist_path.name)
             if not m:
-                logger.warning(f"잘못된 모니터링 파일 이름 패턴: {hist_path.name}")
+                logger.warning(f"잘못된 모니터링 파일 이름 패턴 무시: {hist_path.name}")
                 continue
 
             try:
-                data = await load_json_data_async(hist_path) # Consistent locking
+                data = await load_json_data_async(hist_path)
             except json.JSONDecodeError:
                 logger.error(f"모니터링 복원 중 JSON 디코딩 오류 ({hist_path.name}). 파일 삭제 시도.")
-                try: hist_path.unlink()
+                try: hist_path.unlink(missing_ok=True) # missing_ok 추가 (Python 3.8+)
                 except OSError as e_unlink: logger.error(f"손상된 모니터링 파일 삭제 실패 ({hist_path.name}): {e_unlink}")
                 continue
-            except FileNotFoundError: # Should not happen if glob caught it, but for safety
+            except FileNotFoundError:
                 logger.warning(f"모니터링 복원 중 파일 없음 (race condition?): {hist_path.name}")
                 continue
 
-            start_time_str = data.get("start_time") # For monitor metadata
-
+            start_time_str = data.get("start_time")
             last_fetch_str = data.get("last_fetch")
-            last_fetch_source_for_log = last_fetch_str # For logging original value
             
             if not last_fetch_str:
-                logger.warning(f"last_fetch 누락 ({hist_path.name}). 즉시 실행 및 정기 간격으로 예약됩니다.")
+                # last_fetch가 없는 경우, 오래된 것으로 간주하여 즉시 실행하고 다음 정기 실행 예약
+                logger.warning(f"last_fetch 누락 ({hist_path.name}). 즉시 실행 대상으로 처리.")
                 last_fetch = now - timedelta(minutes=31) # 30분 이상 경과한 것으로 처리
-                last_fetch_source_for_log = f"누락되어 '{format_datetime(last_fetch)}'로 설정됨"
             else:
                 try:
                     last_fetch = datetime.strptime(last_fetch_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
                 except ValueError as e_time:
-                    logger.warning(f"잘못된 last_fetch 형식 ({hist_path.name}): '{last_fetch_str}' ({e_time}). 즉시 실행 및 정기 간격으로 예약됩니다.")
-                    last_fetch = now - timedelta(minutes=31) # 30분 이상 경과한 것으로 처리
-                    last_fetch_source_for_log = f"형식오류로 '{format_datetime(last_fetch)}'로 설정됨"
-
+                    logger.warning(f"잘못된 last_fetch 형식 ({hist_path.name}): '{last_fetch_str}' ({e_time}). 즉시 실행 대상으로 처리.")
+                    last_fetch = now - timedelta(minutes=31)
 
             interval = timedelta(minutes=30)
             delta = now - last_fetch
@@ -1775,63 +1796,54 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
             uid = int(m.group("uid"))
             dep, arr, dd, rd = m.group("dep"), m.group("arr"), m.group("dd"), m.group("rd")
             
-            job_base_name = str(hist_path) # Base name for jobs related to this monitor
+            job_base_name = str(hist_path)
 
-            # 즉시 실행 작업 (Catch-up job)
+            # 마감된 작업 즉시 실행 (Catch-up job)
             if delta >= interval:
-                logger.info(
-                    f"즉시 조회 예약 (Overdue): {hist_path.name} | "
-                    f"Last Fetch: {last_fetch_source_for_log} | Now: {format_datetime(now)} | Delta: {delta.total_seconds()/60:.1f}분 | "
-                    f"예약: 즉시 실행"
-                )
+                logger.info(f"즉시 조회 예약 (경과 시간 {delta.total_seconds()/60:.1f}분): {hist_path.name}")
                 app.job_queue.run_once(
                     monitor_job,
-                    when=timedelta(seconds=0), # Run ASAP
-                    name=f"{job_base_name}_startup_immediate", # Unique name for the immediate job
+                    when=timedelta(seconds=0),
+                    name=f"{job_base_name}_startup_immediate",
                     data={
                         "chat_id": uid,
                         "settings": (dep, arr, dd, rd),
-                        "hist_path": str(hist_path) # Ensure it's a string
+                        "hist_path": str(hist_path)
                     }
                 )
 
             # 정기 반복 작업 (Repeating job)
-            if delta.total_seconds() < 0: # last_fetch is in the future (e.g. system clock changed)
-                next_run_delay = interval # Schedule it one interval from now
+            if delta.total_seconds() < 0: # last_fetch가 미래 시간인 경우 (시스템 시간 변경 등)
+                next_run_delay = interval
                 logger.warning(
-                    f"last_fetch가 미래 시간입니다 ({hist_path.name}): {format_datetime(last_fetch)}. "
+                    f"last_fetch가 미래 시간 ({hist_path.name}): {format_datetime(last_fetch)}. "
                     f"다음 정기 실행은 {next_run_delay.total_seconds()/60:.1f}분 후로 예약합니다."
                 )
             else:
                 time_into_current_cycle = delta % interval
                 next_run_delay = interval - time_into_current_cycle
-                # If next_run_delay is zero, it means it's exactly on the interval boundary.
-                # The job should run 'interval' seconds later because the current "due" slot
-                # is either handled by the immediate job (if overdue) or it's not yet time.
-                if next_run_delay.total_seconds() == 0 and delta.total_seconds() > 0 : # Exactly on time (and not delta=0)
+                if next_run_delay.total_seconds() == 0 and delta.total_seconds() > 0:
                      next_run_delay = interval
 
-
-            logger.info(
-                f"정기 모니터링 등록: {hist_path.name} | "
-                f"Last Fetch: {last_fetch_source_for_log} | Now: {format_datetime(now)} | Delta: {delta.total_seconds()/60:.1f}분 | "
-                f"다음 실행까지 약: {next_run_delay.total_seconds()/60:.1f}분"
-            )
+            # logger.info(
+            #     f"정기 모니터링 등록: {hist_path.name} | "
+            #     f"Last Fetch: {last_fetch_str if last_fetch_str else 'N/A'} | Now: {format_datetime(now)} | Delta: {delta.total_seconds()/60:.1f}분 | "
+            #     f"다음 실행까지 약: {next_run_delay.total_seconds()/60:.1f}분"
+            # ) # 상세 로그는 유지하거나 필요시 주석 해제
 
             job = app.job_queue.run_repeating(
                 monitor_job,
                 interval=interval,
-                first=next_run_delay, # timedelta specifying the delay for the first run
-                name=job_base_name,    # Use the base name for the repeating job
+                first=next_run_delay,
+                name=job_base_name,
                 data={
                     "chat_id": uid,
                     "settings": (dep, arr, dd, rd),
-                    "hist_path": str(hist_path) # Ensure it's a string
+                    "hist_path": str(hist_path)
                 }
             )
             active_jobs_restored +=1
 
-            # 모니터링 메타데이터 업데이트 (선택 사항)
             parsed_start_time = now # Fallback
             if start_time_str:
                 try:
@@ -1846,9 +1858,9 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
                 "job_name_repeating": job.name 
             })
 
-        except Exception as ex_outer: # Catch any unexpected error during single file processing
+        except Exception as ex_outer:
             logger.error(f"모니터링 복원 중 ({hist_path.name}) 처리 실패: {ex_outer}", exc_info=True)
-            # Consider removing the problematic hist_path file if errors persist across restarts
+            # 오류 발생한 모니터링 파일 삭제 시도 (선택적)
             # try:
             #     hist_path.unlink(missing_ok=True)
             #     logger.info(f"오류 발생으로 모니터링 파일 삭제 시도: {hist_path.name}")
@@ -2007,7 +2019,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
                 logger.error(f"관리자({admin_id})에게 알림 전송 실패: {ex}")
 
 async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """공항 코드 목록 보기"""
+    """등록된 주요 공항 코드 목록을 보여줍니다."""
     logger.info(f"사용자 {update.effective_user.id} 요청: /airport")
     # airport 명령어 실행 시 키보드 유지
     keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
@@ -2025,23 +2037,40 @@ async def cleanup_resources():
     logger.info("리소스 정리 완료")
 
 def main():
-    logger.info("메인 함수 시작: ApplicationBuilder 설정 중...")
+    # main 함수 시작 부분에 로그 로테이션 및 로깅 설정 추가
+    rotate_logs()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+
+    # httpx 로거의 레벨을 WARNING으로 설정하여 INFO 로그 비활성화
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    logger.info("텔레그램 봇 애플리케이션 시작 중...")
     
     # 환경변수 검증
     errors = validate_env_vars()
     if errors:
         for error in errors:
             logger.error(error)
-        return
+        # 환경변수 오류 시에는 봇을 시작하지 않고 종료
+        logger.error("환경변수 설정 오류로 인해 봇을 시작할 수 없습니다.")
+        return # main 함수 종료
     
     if not BOT_TOKEN:
-        logger.error("환경변수 BOT_TOKEN이 설정되어 있지 않습니다.")
-        return
+        # 이 경우는 validate_env_vars에서 이미 처리되지만, 추가 방어 코드
+        logger.error("환경변수 BOT_TOKEN이 설정되어 있지 않습니다. 봇을 시작할 수 없습니다.")
+        return # main 함수 종료
     
     application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
     
-    # 작업 디렉토리 생성
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 작업 디렉토리 생성 (DATA_DIR은 이미 상단에서 생성 시도됨, USER_CONFIG_DIR 등)
+    # DATA_DIR.mkdir(parents=True, exist_ok=True) # 중복될 수 있으므로 확인
     
     # 핸들러 등록
     conv_handler = ConversationHandler(
