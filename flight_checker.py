@@ -12,6 +12,7 @@
 - CONFIG_RETENTION_DAYS: (선택) 사용자 설정 파일 보관 기간 (일, 기본값: 7)
 - MAX_WORKERS       : (선택) Selenium 작업용 최대 동시 실행 브라우저 수 (기본값: 5)
 - FILE_WORKERS      : (선택) 파일 I/O 작업용 최대 동시 작업자 수 (기본값: 5)
+- LOG_LEVEL         : (선택) 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL 중 선택, 기본값: INFO)
 """
 import os
 import re
