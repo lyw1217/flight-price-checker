@@ -9,6 +9,7 @@
 - MAX_MONITORS      : (선택) 사용자당 최대 모니터링 개수 (기본 3)
 - DATA_RETENTION_DAYS: (선택) 모니터링 데이터 보관 기간 (일, 기본 30)
 - CONFIG_RETENTION_DAYS: (선택) 사용자 설정 파일 보관 기간 (일, 기본 7)
+- MAX_WORKERS       : (선택) 최대 동시 작업자 수 (기본 10)
 """
 import os
 import re
@@ -23,7 +24,9 @@ from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ConversationHandler,
@@ -37,6 +40,279 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sys
+import threading
+from typing import Optional, Tuple, Dict, Any
+from telegram.error import BadRequest, TimedOut, NetworkError
+
+# 안전한 메시지 편집 함수
+async def safe_edit_message(
+    message: Message, 
+    text: str, 
+    parse_mode: str = None,
+    reply_markup=None,
+    disable_web_page_preview: bool = True,
+    max_retries: int = 3
+) -> Optional[Message]:
+    """
+    안전한 메시지 편집 함수
+    - 편집 불가능한 경우 새 메시지 발송
+    - 네트워크 에러 시 재시도
+    """
+    for attempt in range(max_retries):
+        try:
+            return await message.edit_text(
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview
+            )
+        except BadRequest as e:
+            error_msg = str(e).lower()
+            
+            if "message can't be edited" in error_msg:
+                logger.warning(f"메시지 편집 불가, 새 메시지 발송: {e}")
+                try:
+                    return await message.reply_text(
+                        text=text,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=disable_web_page_preview
+                    )
+                except Exception as reply_error:
+                    logger.error(f"새 메시지 발송도 실패: {reply_error}")
+                    return None
+            
+            elif "message is not modified" in error_msg:
+                logger.debug("메시지 내용이 동일하여 편집하지 않음")
+                return message
+            
+            elif attempt < max_retries - 1:
+                logger.warning(f"메시지 편집 재시도 {attempt + 1}/{max_retries}: {e}")
+                await asyncio.sleep(1)
+                continue
+            else:
+                logger.error(f"메시지 편집 최종 실패: {e}")
+                return None
+                
+        except (TimedOut, NetworkError) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 지수 백오프
+                logger.warning(f"네트워크 에러, {wait_time}초 후 재시도: {e}")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"네트워크 에러 최종 실패: {e}")
+                return None
+        
+        except Exception as e:
+            logger.error(f"예상치 못한 에러: {e}")
+            return None
+    
+    return None
+
+# 메시지 상태 관리 클래스
+class MessageManager:
+    def __init__(self):
+        # 사용자별 상태 메시지 추적
+        self.status_messages: Dict[int, Message] = {}
+        # 메시지 편집 잠금 (동시 편집 방지)
+        self.edit_locks: Dict[str, asyncio.Lock] = {}
+    
+    def get_lock(self, message_key: str) -> asyncio.Lock:
+        """메시지별 편집 잠금 반환"""
+        if message_key not in self.edit_locks:
+            self.edit_locks[message_key] = asyncio.Lock()
+        return self.edit_locks[message_key]
+    
+    async def update_status_message(
+        self, 
+        user_id: int, 
+        text: str, 
+        parse_mode: str = "Markdown",
+        reply_markup=None
+    ) -> Optional[Message]:
+        """사용자별 상태 메시지 업데이트"""
+        message_key = f"status_{user_id}"
+        
+        async with self.get_lock(message_key):
+            current_message = self.status_messages.get(user_id)
+            
+            if current_message:
+                # 기존 메시지 편집 시도
+                updated_message = await safe_edit_message(
+                    current_message, 
+                    text, 
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+                
+                if updated_message:
+                    self.status_messages[user_id] = updated_message
+                    return updated_message
+                else:
+                    # 편집 실패 시 새 메시지로 교체
+                    del self.status_messages[user_id]
+            
+            return None
+    
+    def set_status_message(self, user_id: int, message: Message):
+        """상태 메시지 등록"""
+        self.status_messages[user_id] = message
+    
+    def clear_status_message(self, user_id: int):
+        """상태 메시지 제거"""
+        if user_id in self.status_messages:
+            del self.status_messages[user_id]
+
+# 전역 메시지 매니저
+message_manager = MessageManager()
+
+# Selenium 작업 관리를 위한 전용 매니저 클래스
+class SeleniumManager:
+    def __init__(self, max_workers: int = 3, grid_url: str = None, user_agent: str = None):
+        """
+        Selenium 작업을 위한 전용 매니저
+        
+        Args:
+            max_workers: 동시 실행할 최대 브라우저 수
+            grid_url: Selenium Grid URL
+            user_agent: 브라우저 User-Agent
+        """
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="selenium")
+        self.grid_url = grid_url
+        self.user_agent = user_agent
+        self.active_tasks = 0
+        self.lock = threading.Lock()
+    
+    def setup_driver(self) -> webdriver.Remote:
+        """브라우저 드라이버 설정"""
+        options = webdriver.ChromeOptions()
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--headless')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        if self.user_agent:
+            options.add_argument(f'user-agent={self.user_agent}')
+        
+        if self.grid_url:
+            # Selenium Grid 사용
+            driver = webdriver.Remote(
+                command_executor=self.grid_url,
+                options=options
+            )
+        else:
+            # 로컬 ChromeDriver 사용
+            driver = webdriver.Chrome(options=options)
+        
+        return driver
+    
+    def _fetch_single(self, url: str, depart: str, arrive: str, config: dict) -> Tuple[Any, str, Any, str, str]:
+        """단일 조회 실행 (동기 함수)"""
+        with self.lock:
+            self.active_tasks += 1
+            task_id = self.active_tasks
+        
+        logger.info(f"Selenium 작업 시작 #{task_id}: {depart}->{arrive}")
+        driver = None
+        
+        try:
+            driver = self.setup_driver()
+            overall_price, restricted_price = None, None
+            overall_info, restricted_info = "", ""
+            
+            driver.get(url)
+            WebDriverWait(driver, 40).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="inlineFilter_FilterWrapper__"]'))
+            )
+            time_module.sleep(5)
+            items = driver.find_elements(By.XPATH, '//*[@id="international-content"]/div/div[3]/div')
+            
+            if not items:
+                logger.warning(f"NO_ITEMS for {url}")
+                raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (NO_ITEMS)")
+
+            found_any_price = False
+            for item in items:
+                text = item.text
+                logger.debug(f"항공권 정보 텍스트: {text}")
+                
+                if "경유" in text:
+                    logger.debug("경유 항공편 제외")
+                    continue
+                    
+                flight_info = parse_flight_info(text, depart, arrive)
+                if not flight_info:
+                    continue
+                    
+                dep_departure, dep_arrival, ret_departure, ret_arrival, price = flight_info
+                found_any_price = True
+                
+                if overall_price is None or price < overall_price:
+                    overall_price = price
+                    overall_info = (
+                        f"가는 편: {dep_departure} → {dep_arrival}\n"
+                        f"오는 편: {ret_departure} → {ret_arrival}\n"
+                        f"왕복 가격: {price:,}원"
+                    )
+                    logger.debug(f"전체 최저가 갱신: {price:,}원")
+                
+                if check_time_restrictions(dep_departure, ret_departure, config):
+                    if restricted_price is None or price < restricted_price:
+                        restricted_price = price
+                        restricted_info = (
+                            f"가는 편: {dep_departure} → {dep_arrival}\n"
+                            f"오는 편: {ret_departure} → {ret_arrival}\n"
+                            f"왕복 가격: {price:,}원"
+                        )
+                        logger.info(f"조건부 최저가 갱신: {price:,}원")
+
+            if not found_any_price:
+                logger.warning(f"NO_PRICES (found_any_price=False) for {url}")
+                raise NoMatchingFlightsException("조건에 맞는 항공권을 찾을 수 없습니다 (NO_PRICES_PARSED)")
+            
+            logger.info(f"Selenium 작업 완료 #{task_id}")
+            return restricted_price, restricted_info, overall_price, overall_info, url
+            
+        except Exception as e:
+            logger.error(f"Selenium 작업 #{task_id} 실패: {e}")
+            raise
+        finally:
+            if driver:
+                driver.quit()
+            with self.lock:
+                self.active_tasks -= 1
+
+    async def fetch_prices_async(self, url: str, depart: str, arrive: str, config: dict) -> Tuple[Any, str, Any, str, str]:
+        """비동기 가격 조회"""
+        loop = asyncio.get_running_loop()
+        
+        try:
+            result = await loop.run_in_executor(
+                self.executor,
+                self._fetch_single,
+                url, depart, arrive, config
+            )
+            return result
+        except Exception as e:
+            logger.error(f"비동기 fetch_prices 실패: {e}")
+            raise
+    
+    def shutdown(self):
+        """리소스 정리"""
+        logger.info("SeleniumManager 종료 중...")
+        self.executor.shutdown(wait=True)
+
+# 전역 Selenium 매니저 인스턴스 생성
+selenium_manager = SeleniumManager(
+    max_workers=int(os.getenv("SELENIUM_WORKERS", "5")),
+    grid_url=os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub"),
+    user_agent=os.getenv("USER_AGENT")
+)
+
+# 파일 작업용 executor
+FILE_WORKERS = int(os.getenv("FILE_WORKERS", "5"))
+file_executor = ThreadPoolExecutor(max_workers=FILE_WORKERS, thread_name_prefix="file")
 
 # --- 설정 및 초기화 ---
 DATA_DIR = Path("/data")
@@ -71,6 +347,33 @@ DEFAULT_USER_CONFIG = {
     "last_activity": None,             # 마지막 활동 시간
     "created_at": None                 # 설정 생성 시간
 }
+
+async def load_json_data_async(file_path: Path) -> dict:
+    """비동기 JSON 데이터 로드"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(file_executor, load_json_data, file_path)
+
+async def save_json_data_async(file_path: Path, data: dict):
+    """비동기 JSON 데이터 저장"""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(file_executor, save_json_data, file_path, data)
+
+async def get_user_config_async(user_id: int) -> dict:
+    """비동기 사용자 설정 로드"""
+    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
+    if config_file.exists():
+        try:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(file_executor, lambda: get_user_config(user_id))
+            return data
+        except Exception as e:
+            logger.error(f"사용자 설정 로드 중 오류: {e}")
+    
+    default_config = DEFAULT_USER_CONFIG.copy()
+    default_config['created_at'] = format_datetime(datetime.now())
+    default_config['last_activity'] = format_datetime(datetime.now())
+    await loop.run_in_executor(file_executor, lambda: save_user_config(user_id, default_config))
+    return default_config
 
 def get_user_config(user_id: int) -> dict:
     """사용자 설정을 가져옵니다."""
@@ -150,7 +453,7 @@ def format_time_range(config: dict, direction: str) -> str:
 async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """사용자 설정 확인 및 변경"""
     user_id = update.effective_user.id
-    config = get_user_config(user_id)
+    config = await get_user_config_async(user_id)
     
     msg_lines = [
         "⚙️ *시간 제한 설정*",
@@ -202,7 +505,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     direction = "outbound" if direction == "가는편" else "inbound"
-    config = get_user_config(user_id)
+    config = await get_user_config_async(user_id)
     
     if set_type == "시각":
         if len(values) != 1 or not values[0].isdigit():
@@ -240,7 +543,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    save_user_config(user_id, config)
+    await save_user_config_async(user_id, config)
     await update.message.reply_text(
         f"✅ {direction=='outbound'and'가는 편'or'오는 편'} 설정이 변경되었습니다:\n"
         f"{format_time_range(config, direction)}"
@@ -399,97 +702,52 @@ class NoMatchingFlightsException(Exception):
     pass
 
 # Modified fetch_prices to raise custom exceptions
-def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries=3, user_id=None):
+async def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries=3, user_id=None):
+    """항공권 가격 조회 (비동기 처리)"""
     logger.info(f"fetch_prices 호출: {depart}->{arrive} {d_date}~{r_date} (User: {user_id})")
     url = (
         f"https://flight.naver.com/flights/international/"
         f"{depart}-{arrive}-{d_date}/{arrive}-{depart}-{r_date}?adult=1&fareType=Y"
     )
-    config = get_user_config(user_id) if user_id else DEFAULT_USER_CONFIG.copy()
+    config = await get_user_config_async(user_id) if user_id else DEFAULT_USER_CONFIG.copy()
     
-    last_exception = None
-    for attempt in range(max_retries):
-        try:
-            driver = setup_selenium_driver()
-            overall_price, restricted_price = None, None
-            overall_info, restricted_info = "", ""
+    async def _fetch_with_retry():
+        last_exception = None
+        for attempt in range(max_retries):
             try:
-                driver.get(url)
-                WebDriverWait(driver, 40).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="inlineFilter_FilterWrapper__"]'))
-                )
-                time_module.sleep(5) # Consider reducing or making conditional
-                items = driver.find_elements(By.XPATH, '//*[@id="international-content"]/div/div[3]/div')
+                logger.info(f"시도 {attempt + 1}/{max_retries}: {depart}->{arrive}")
                 
-                if not items:
-                    logger.warning(f"NO_ITEMS on attempt {attempt+1} for {url}")
-                    raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (NO_ITEMS)")
-
-                found_any_price = False
-                for item in items:
-                    text = item.text
-                    logger.debug(f"항공권 정보 텍스트: {text}")
-                    
-                    if "경유" in text:
-                        logger.debug("경유 항공편 제외")
-                        continue
-                        
-                    # 항공편 정보 파싱
-                    flight_info = parse_flight_info(text, depart, arrive)
-                    if not flight_info:
-                        continue
-                        
-                    dep_departure, dep_arrival, ret_departure, ret_arrival, price = flight_info
-                    found_any_price = True
-                    
-                    # 전체 최저가 갱신
-                    if overall_price is None or price < overall_price:
-                        overall_price = price
-                        overall_info = (
-                            f"가는 편: {dep_departure} → {dep_arrival}\n"
-                            f"오는 편: {ret_departure} → {ret_arrival}\n"
-                            f"왕복 가격: {price:,}원"
-                        )
-                        logger.debug(f"전체 최저가 갱신: {price:,}원")
-                    
-                    # 시간 제한 체크
-                    if check_time_restrictions(dep_departure, ret_departure, config):
-                        if restricted_price is None or price < restricted_price:
-                            restricted_price = price
-                            restricted_info = (
-                                f"가는 편: {dep_departure} → {dep_arrival}\n"
-                                f"오는 편: {ret_departure} → {ret_arrival}\n"
-                                f"왕복 가격: {price:,}원"
-                            )
-                            logger.info(f"조건부 최저가 갱신: {price:,}원")
-
-                if not found_any_price: # After loop, if no prices were parsed from items
-                    logger.warning(f"NO_PRICES (found_any_price=False) on attempt {attempt+1} for {url}")
-                    raise NoMatchingFlightsException("조건에 맞는 항공권을 찾을 수 없습니다 (NO_PRICES_PARSED)")
+                # 전역 selenium_manager 사용
+                result = await selenium_manager.fetch_prices_async(url, depart, arrive, config)
                 
-                return restricted_price, restricted_info, overall_price, overall_info, url
-            finally:
-                driver.quit()
-        except (NoFlightDataException, NoMatchingFlightsException) as e: # Catch specific exceptions to re-raise if final
-            last_exception = e
-            logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패 (Specific): {e}")
-            if attempt == max_retries - 1: raise
-        except Exception as ex: # Catch other selenium/network errors
-            last_exception = ex
-            logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패 (Generic): {ex}", exc_info=True)
-            if attempt == max_retries - 1:
-                # Wrap generic exceptions for a standard message if not already specific
-                raise Exception(f"항공권 조회 중 오류가 발생했습니다: {ex}") from ex
-        time_module.sleep(5 * (attempt + 1))
-    
-    # Fallback if loop finishes without returning (should be covered by raises)
-    if last_exception: raise last_exception # Should be one of the custom ones or the wrapped generic
-    raise Exception("항공권 조회 중 알 수 없는 오류로 모든 시도 실패")
+                logger.info(f"조회 성공: {depart}->{arrive} (시도 {attempt + 1})")
+                return result
+                
+            except (NoFlightDataException, NoMatchingFlightsException) as e:
+                last_exception = e
+                logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패 (Specific): {e}")
+                if attempt == max_retries - 1:
+                    raise
+            except Exception as ex:
+                last_exception = ex
+                logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패 (Generic): {ex}", exc_info=True)
+                if attempt == max_retries - 1:
+                    raise Exception(f"항공권 조회 중 오류가 발생했습니다: {ex}") from ex
+                
+                wait_time = 5 * (attempt + 1)
+                logger.info(f"{wait_time}초 대기 후 재시도...")
+                await asyncio.sleep(wait_time)
+        
+        if last_exception:
+            raise last_exception
+        raise Exception("항공권 조회 중 알 수 없는 오류로 모든 시도 실패")
+
+    return await _fetch_with_retry()
 
 # 도움말 텍스트
-async def help_text() -> str:
+async def help_text(user_id: int = None) -> str:
     admin_help = ""
-    if ADMIN_IDS:
+    if ADMIN_IDS and user_id in ADMIN_IDS:
         admin_help = (
             "\n\n👑 *관리자 명령어*\n"
             "• /allstatus - 전체 모니터링 현황\n"
@@ -534,7 +792,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 관리자 여부에 따라 다른 키보드 표시
     keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
-        await help_text(),
+        await help_text(update.effective_user.id),
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -544,7 +802,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 관리자 여부에 따라 다른 키보드 표시
     keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
-        await help_text(),
+        await help_text(update.effective_user.id),
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -795,9 +1053,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     final_keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
     text = update.message.text.strip().split()
-    len_text = len(text)
 
-    if len_text != 4:
+    if len(text) != 4:
         logger.warning(f"monitor_setting ({user_id}): 형식 오류 - {text}")
         await update.message.reply_text(
             "❗ 형식 오류\n"
@@ -805,159 +1062,266 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "- 공항코드: 3자리 영문\n"
             "- 날짜: YYYYMMDD\n\n"
             "💡 주요 공항 코드 목록은 /airport 명령으로 확인하실 수 있습니다.\n"
-            "다시 입력하시거나 /cancel 명령으로 취소하세요.", # Guidance
+            "다시 입력하시거나 /cancel 명령으로 취소하세요.",
             parse_mode="Markdown"
-            # Keyboard remains removed as per monitor_cmd, user types text or /cancel
         )
-        return SETTING # Stay in state for retry or /cancel
+        return SETTING
 
     outbound_dep, outbound_arr, outbound_date, inbound_date = text
     outbound_dep = outbound_dep.upper()
     outbound_arr = outbound_arr.upper()
 
-    # Airport code validation
-    for code, name in [(outbound_dep, "출발"), (outbound_arr, "도착")]:
-        is_valid, msg = valid_airport(code)
-        if not is_valid:
-            await update.message.reply_text(f"❗ {name}공항 코드 오류: {msg}\n다시 입력하시거나 /cancel 명령으로 취소하세요.", reply_markup=final_keyboard)
-            return ConversationHandler.END # End on error here, keyboard restored by new message
-
-    if outbound_dep == outbound_arr:
-        await update.message.reply_text("❗ 출발지와 도착지가 같을 수 없습니다.\n다시 입력하시거나 /cancel 명령으로 취소하세요.", reply_markup=final_keyboard)
-        return ConversationHandler.END
-
-    # Date validation
-    for date_str, name in [(outbound_date, "가는 편"), (inbound_date, "오는 편")]:
-        is_valid, msg = valid_date(date_str)
-        if not is_valid:
-            await update.message.reply_text(f"❗ {name} 날짜 오류: {msg}\n다시 입력하시거나 /cancel 명령으로 취소하세요.", reply_markup=final_keyboard)
-            return ConversationHandler.END
-            
-    outbound_date_obj = _dt.strptime(outbound_date, "%Y%m%d")
-    inbound_date_obj = _dt.strptime(inbound_date, "%Y%m%d")
-    if inbound_date_obj <= outbound_date_obj:
-        await update.message.reply_text("❗ 오는 편 날짜는 가는 편 날짜보다 뒤여야 합니다.\n다시 입력하시거나 /cancel 명령으로 취소하세요.", reply_markup=final_keyboard)
-        return ConversationHandler.END
-
-    existing = [p for p in DATA_DIR.iterdir() if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id]
-    if len(existing) >= MAX_MONITORS:
-        logger.warning(f"사용자 {user_id} 최대 모니터링 초과")
-        await update.message.reply_text(f"❗ 최대 {MAX_MONITORS}개까지 모니터링할 수 있습니다.", reply_markup=final_keyboard)
-        return ConversationHandler.END # End conversation
-
-    _, dep_city, dep_airport = get_airport_info(outbound_dep)
-    _, arr_city, arr_airport = get_airport_info(outbound_arr)
-    dep_city = dep_city or outbound_dep
-    dep_airport = dep_airport or f"{outbound_dep}공항"
-    arr_city = arr_city or outbound_arr
-    arr_airport = arr_airport or f"{outbound_arr}공항"
-
-    logger.info(f"사용자 {user_id} 설정: {outbound_dep}->{outbound_arr} {outbound_date}~{inbound_date}")
-    await update.message.reply_text( # Initial confirmation, no keyboard yet
-        "✅ *항공권 모니터링 시작*\n"
-        f"가는 편: {dep_city} ({outbound_dep}) → {arr_city} ({outbound_arr})\n"
-        f"오는 편: {arr_city} ({outbound_arr}) → {dep_city} ({outbound_dep})\n"
-        f"일정: {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}\n\n"
-        "🔍 첫 조회 중...",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove() # Ensure keyboard is removed if any was present
+    # 초기 상태 메시지 생성
+    status_message = await update.message.reply_text(
+        "🔍 항공권 정보를 조회하는 중입니다...\n⏳ 잠시만 기다려주세요.",
+        reply_markup=None
     )
+    
+    # 메시지 매니저에 등록
+    message_manager.set_status_message(user_id, status_message)
+    
+    try:
+        # 기존 모니터링 개수 확인
+        loop = asyncio.get_running_loop()
+        existing = await loop.run_in_executor(
+            file_executor,
+            lambda: [p for p in DATA_DIR.iterdir() 
+                    if PATTERN.fullmatch(p.name) and 
+                    int(PATTERN.fullmatch(p.name).group('uid')) == user_id]
+        )
+        
+        if len(existing) >= MAX_MONITORS:
+            logger.warning(f"사용자 {user_id} 최대 모니터링 초과")
+            await message_manager.update_status_message(
+                user_id,
+                f"❗ 최대 {MAX_MONITORS}개까지 모니터링할 수 있습니다.",
+                reply_markup=final_keyboard
+            )
+            return ConversationHandler.END
+
+        # 공항 정보 확인
+        _, dep_city, dep_airport = get_airport_info(outbound_dep)
+        _, arr_city, arr_airport = get_airport_info(outbound_arr)
+        dep_city = dep_city or outbound_dep
+        dep_airport = dep_airport or f"{outbound_dep}공항"
+        arr_city = arr_city or outbound_arr
+        arr_airport = arr_airport or f"{outbound_arr}공항"
+
+        # 진행 상황 업데이트
+        await message_manager.update_status_message(
+            user_id,
+            f"🔍 {dep_city} → {arr_city} 항공권 조회 중...\n⏳ 네이버 항공권에서 정보를 가져오고 있습니다."
+        )
+        
+        # 가격 조회 (시간이 오래 걸리는 작업)
+        try:
+            restricted, r_info, overall, o_info, link = await fetch_prices(
+                outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
+            )
+            
+            if restricted is None and overall is None:
+                raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (결과 없음)")
+            
+        except Exception as fetch_error:
+            logger.error(f"가격 조회 실패 (User: {user_id}): {fetch_error}")
+            await message_manager.update_status_message(
+                user_id,
+                f"❌ 항공권 조회 중 오류가 발생했습니다.\n\n🔸 {str(fetch_error)}\n\n다시 시도해 주세요.",
+                reply_markup=final_keyboard
+            )
+            return ConversationHandler.END
+        
+        # 모니터링 설정 저장
+        hist_path = DATA_DIR / f"price_{user_id}_{outbound_dep}_{outbound_arr}_{outbound_date}_{inbound_date}.json"
+        start_time = format_datetime(datetime.now())
+        user_config = await get_user_config_async(user_id)
+        
+        await save_json_data_async(hist_path, {
+            "start_time": start_time,
+            "restricted": restricted or 0,
+            "overall": overall or 0,
+            "last_fetch": format_datetime(datetime.now()),
+            "time_setting_outbound": format_time_range(user_config, 'outbound'),
+            "time_setting_inbound": format_time_range(user_config, 'inbound')
+        })
+
+        # 작업 스케줄러 등록
+        job = ctx.application.job_queue.run_repeating(
+            monitor_job, 
+            interval=timedelta(minutes=30), 
+            first=timedelta(seconds=0),
+            name=str(hist_path), 
+            data={
+                "chat_id": user_id, 
+                "settings": (outbound_dep, outbound_arr, outbound_date, inbound_date),
+                "hist_path": str(hist_path)
+            }
+        )
+
+        monitors = ctx.application.bot_data.setdefault("monitors", {})
+        monitors.setdefault(user_id, []).append({
+            "settings": (outbound_dep, outbound_arr, outbound_date, inbound_date),
+            "start_time": datetime.now(KST),
+            "hist_path": str(hist_path),
+            "job": job
+        })
+
+        logger.info(f"모니터링 시작 등록: {hist_path}")
+        
+        # 최종 성공 메시지
+        msg_lines = [
+            f"✅ *{dep_city} ↔ {arr_city} 모니터링 시작*",
+            f"🛫 가는 편: {dep_airport} → {arr_airport}",
+            f"🛬 오는 편: {arr_airport} → {dep_airport}",
+            f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
+            "",
+            "⚙️ *적용된 시간 제한*",
+            f"• 가는 편: {format_time_range(user_config, 'outbound')}",
+            f"• 오는 편: {format_time_range(user_config, 'inbound')}",
+            "",
+            "📊 *현재 최저가*"
+        ]
+        
+        if restricted:
+            msg_lines.extend([f"🎯 *시간 제한 적용 최저가*", r_info, ""])
+        if overall:
+            msg_lines.extend([f"📌 *전체 최저가*", o_info])
+            
+        msg_lines.extend([
+            "", "ℹ️ 30분마다 자동으로 가격을 확인하며,", 
+            "가격이 하락하면 알림을 보내드립니다.",
+            "", f"🔗 [네이버 항공권 바로가기]({link})"
+        ])
+        
+        # 최종 결과 업데이트
+        final_result = await message_manager.update_status_message(
+            user_id,
+            "\n".join(msg_lines),
+            parse_mode="Markdown",
+            reply_markup=final_keyboard
+        )
+        
+        if not final_result:
+            # 편집 실패 시 새 메시지 발송
+            await update.message.reply_text(
+                "\n".join(msg_lines),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+                reply_markup=final_keyboard
+            )
+        
+    except Exception as e:
+        logger.error(f"monitor_setting 전체 실패 (User: {user_id}): {e}")
+        await message_manager.update_status_message(
+            user_id,
+            f"❌ 처리 중 오류가 발생했습니다.\n{str(e)}",
+            reply_markup=final_keyboard
+        )
+    
+    finally:
+        # 상태 메시지 정리
+        message_manager.clear_status_message(user_id)
+    
+    return ConversationHandler.END
+
+async def run_fetch_prices(status_message, dep, arr, d_date, r_date, user_id, ctx):
+    final_keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
 
     try:
-        loop = asyncio.get_running_loop()
-        restricted, r_info, overall, o_info, link = await loop.run_in_executor(
-            None, fetch_prices, outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
+        restricted, r_info, overall, o_info, link = await fetch_prices(dep, arr, d_date, r_date, 3, user_id)
+        if restricted is None and overall is None:
+            raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (결과 없음)")
+        hist_path = DATA_DIR / f"price_{user_id}_{dep}_{arr}_{d_date}_{r_date}.json"
+        user_config = await get_user_config_async(user_id)
+        await save_json_data_async(hist_path, {
+            "start_time": format_datetime(datetime.now()),
+            "restricted": restricted or 0,
+            "overall": overall or 0,
+            "last_fetch": format_datetime(datetime.now()),
+            "time_setting_outbound": format_time_range(user_config, 'outbound'),
+            "time_setting_inbound": format_time_range(user_config, 'inbound')
+        })
+
+        job = ctx.application.job_queue.run_repeating(
+            monitor_job, interval=timedelta(minutes=30), first=timedelta(seconds=0),
+            name=str(hist_path), data={
+                "chat_id": user_id, "settings": (dep, arr, d_date, r_date),
+                "hist_path": str(hist_path)
+            }
         )
-        if restricted is None and overall is None: # Explicitly check if fetch_prices returned no data
-             raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (결과 없음)")
+
+        monitors = ctx.application.bot_data.setdefault("monitors", {})
+        monitors.setdefault(user_id, []).append({
+            "settings": (dep, arr, d_date, r_date),
+            "start_time": datetime.now(KST),
+            "hist_path": str(hist_path),
+            "job": job
+        })
+
+        _, dep_city, dep_airport = get_airport_info(dep)
+        _, arr_city, arr_airport = get_airport_info(arr)
+        dep_city = dep_city or dep
+        arr_city = arr_city or arr
+
+        logger.info(f"모니터링 시작 등록: {hist_path}")
+
+        msg_lines = [
+            f"✅ *{dep_city} ↔ {arr_city} 모니터링 시작*",
+            f"🛫 가는 편: {dep_airport} → {arr_airport}",
+            f"🛬 오는 편: {arr_airport} → {dep_airport}",
+            f"📅 {d_date[:4]}/{d_date[4:6]}/{d_date[6:]} → {r_date[:4]}/{r_date[4:6]}/{r_date[6:]}",
+            "",
+            "⚙️ *적용된 시간 제한*",
+            f"• 가는 편: {format_time_range(user_config, 'outbound')}",
+            f"• 오는 편: {format_time_range(user_config, 'inbound')}",
+            "",
+            "📊 *현재 최저가*"
+        ]
+
+        if restricted:
+            msg_lines.extend(["🎯 *시간 제한 적용 최저가*", r_info, ""])
+        if overall:
+            msg_lines.extend(["📌 *전체 최저가*", o_info])
+            
+        msg_lines.extend([
+            "", "ℹ️ 30분마다 자동으로 가격을 확인하며,", "가격이 하락하면 알림을 보내드립니다.",
+            "", "🔗 네이버 항공권:", link
+        ])
+
+        await status_message.edit_text(
+            "\n".join(msg_lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=final_keyboard
+        )
 
     except NoFlightDataException as e:
         logger.warning(f"항공권 조회 실패 (데이터 없음, 사용자 {user_id}): {e}")
-        await update.message.reply_text(
+        await status_message.edit_text(
             "❗ 지원하지 않는 공항이거나 해당 경로의 항공편이 없습니다.\n"
             "💡 주요 공항 코드 목록은 /airport 명령으로 확인하실 수 있습니다.",
-            reply_markup=final_keyboard
+            reply_markup=final_keyboard,
+            parse_mode="Markdown"
         )
         return ConversationHandler.END
     except NoMatchingFlightsException as e:
         logger.warning(f"항공권 조회 실패 (조건 불일치, 사용자 {user_id}): {e}")
-        await update.message.reply_text(
+        await status_message.edit_text(
              "❗ 현재 설정된 시간 조건에 맞는 항공권을 찾을 수 없습니다.\n"
              "시간 설정을 변경하시려면 /settings 명령어를 사용해주세요.",
-            reply_markup=final_keyboard
+            reply_markup=final_keyboard,
+            parse_mode="Markdown"
         )
         return ConversationHandler.END
     except Exception as e:
         logger.error(f"항공권 조회 중 예측하지 못한 오류 (사용자 {user_id}): {e}", exc_info=True)
-        await update.message.reply_text(
+        await status_message.edit_text(
             "❗ 항공권 조회 중 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.",
-            reply_markup=final_keyboard
+            reply_markup=final_keyboard,
+            parse_mode="Markdown"
         )
         return ConversationHandler.END
 
-    hist_path = DATA_DIR / f"price_{user_id}_{outbound_dep}_{outbound_arr}_{outbound_date}_{inbound_date}.json"
-    start_time = format_datetime(datetime.now())
-    user_config = get_user_config(user_id)
-    
-    # Use save_json_data for consistency
-    save_json_data(hist_path, {
-        "start_time": start_time,
-        "restricted": restricted or 0, # Ensure 0 if None
-        "overall": overall or 0,       # Ensure 0 if None
-        "last_fetch": format_datetime(datetime.now()),
-        # Storing the active setting at the time of creation
-        "time_setting_outbound": format_time_range(user_config, 'outbound'),
-        "time_setting_inbound": format_time_range(user_config, 'inbound')
-    })
-
-    job = ctx.application.job_queue.run_repeating(
-        monitor_job, interval=timedelta(minutes=30), first=timedelta(seconds=0),
-        name=str(hist_path), data={
-            "chat_id": user_id, "settings": (outbound_dep, outbound_arr, outbound_date, inbound_date),
-            "hist_path": str(hist_path)
-        }
-    )
-    # ... (rest of monitor_setting, sending success message with final_keyboard)
-    monitors = ctx.application.bot_data.setdefault("monitors", {})
-    monitors.setdefault(user_id, []).append({
-        "settings": (outbound_dep, outbound_arr, outbound_date, inbound_date),
-        "start_time": datetime.now(KST),
-        "hist_path": str(hist_path),
-        "job": job
-    })
-
-    logger.info(f"모니터링 시작 등록: {hist_path}")
-    
-    msg_lines = [
-        f"✅ *{dep_city} ↔ {arr_city} 모니터링 시작*",
-        f"🛫 가는 편: {dep_airport} → {arr_airport}",
-        f"🛬 오는 편: {arr_airport} → {dep_airport}",
-        f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-        "",
-        "⚙️ *적용된 시간 제한*",
-        f"• 가는 편: {format_time_range(user_config, 'outbound')}",
-        f"• 오는 편: {format_time_range(user_config, 'inbound')}",
-        "",
-        "📊 *현재 최저가*"
-    ]
-    
-    if restricted:
-        msg_lines.extend(["🎯 *시간 제한 적용 최저가*", r_info, ""])
-    if overall:
-        msg_lines.extend(["📌 *전체 최저가*", o_info])
-        
-    msg_lines.extend([
-        "", "ℹ️ 30분마다 자동으로 가격을 확인하며,", "가격이 하락하면 알림을 보내드립니다.",
-        "", "🔗 네이버 항공권:", link
-    ])
-    
-    await update.message.reply_text(
-        "\n".join(msg_lines), parse_mode="Markdown",
-        disable_web_page_preview=True, reply_markup=final_keyboard
-    )
-    return ConversationHandler.END
-
-# Modified monitor_job to handle new exceptions
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     user_id = data['chat_id']
@@ -972,27 +1336,25 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"monitor_job 실행: {outbound_dep}->{outbound_arr}, 히스토리 파일: {hist_path.name}")
 
     try:
-        state = load_json_data(hist_path) # Use load_json_data
+        state = await load_json_data_async(hist_path)
     except json.JSONDecodeError:
         logger.error(f"monitor_job: JSON 디코딩 오류 {hist_path.name}. 작업 중단 및 파일 삭제 시도.")
         try: hist_path.unlink()
         except OSError as e: logger.error(f"손상된 히스토리 파일 삭제 실패 {hist_path.name}: {e}")
         context.job.schedule_removal()
         return
-    except FileNotFoundError: # Should be caught by initial check, but good for race conditions
+    except FileNotFoundError:
         logger.warning(f"monitor_job: 히스토리 파일 (lock 내부) 없음, 작업 중단: {hist_path.name}")
         context.job.schedule_removal()
         return
 
-
     old_restr = state.get("restricted", 0)
     old_overall = state.get("overall", 0)
-    restricted, r_info, overall, o_info, link = None, "", None, "", "" # Ensure defaults
+    restricted, r_info, overall, o_info, link = None, "", None, "", ""
 
     try:
-        loop = asyncio.get_running_loop()
-        restricted, r_info, overall, o_info, link = await loop.run_in_executor(
-            None, fetch_prices, outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
+        restricted, r_info, overall, o_info, link = await fetch_prices(
+            outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
         )
         
         _, dep_city, _ = get_airport_info(outbound_dep)
@@ -1000,12 +1362,11 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         dep_city = dep_city or outbound_dep
         arr_city = arr_city or outbound_arr
 
-        notify_msg_lines = [] # Changed variable name to avoid conflict
+        notify_msg_lines = []
         price_change_occurred = False
 
-        if restricted is not None and old_restr > 0 and restricted < old_restr : # Check old_restr > 0 to avoid notification for first 0 -> X
+        if restricted is not None and old_restr > 0 and restricted < old_restr:
             price_change_occurred = True
-            # ... (price drop message for restricted)
             notify_msg_lines.extend([
                 f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", "",
                 "🎯 *시간 제한 적용 최저가*",
@@ -1013,11 +1374,10 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 r_info
             ])
 
-        if overall is not None and old_overall > 0 and overall < old_overall: # Check old_overall > 0
-            if not price_change_occurred: # First part of notification
+        if overall is not None and old_overall > 0 and overall < old_overall:
+            if not price_change_occurred:
                  notify_msg_lines.extend([f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", ""])
             price_change_occurred = True
-            # ... (price drop message for overall)
             notify_msg_lines.extend([
                 "", "📌 *전체 최저가*",
                 f"💰 {old_overall:,}원 → *{overall:,}원* (-{old_overall - overall:,}원)",
@@ -1029,15 +1389,21 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 "", f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
                 "🔗 네이버 항공권:", link
             ])
-            await context.bot.send_message(user_id, "\n".join(notify_msg_lines), parse_mode="Markdown")
-            logger.info(f"가격 하락 알림 전송 완료 for {hist_path.name}")
+            try:
+                await context.bot.send_message(
+                    user_id, 
+                    "\n".join(notify_msg_lines), 
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+                logger.info(f"가격 하락 알림 전송 완료 for {hist_path.name}")
+            except Exception as send_error:
+                logger.error(f"가격 하락 알림 전송 실패 ({hist_path.name}): {send_error}")
 
     except NoMatchingFlightsException:
         logger.info(f"monitor_job: 조건에 맞는 항공권 없음 - {hist_path.name}")
-        user_config = get_user_config(user_id) # Get current config for message
-        # Check if this is a persistent state or if prices were previously found
-        if old_restr != 0 or old_overall != 0: # If there were prices before, notify about lack of them now
-            # Construct a Naver link even if no flights found, for user to check manually
+        user_config = await get_user_config_async(user_id)
+        if old_restr != 0 or old_overall != 0:
             naver_link = f"https://flight.naver.com/flights/international/{outbound_dep}-{outbound_arr}-{outbound_date}/{outbound_arr}-{outbound_dep}-{inbound_date}?adult=1&fareType=Y"
             msg_lines = [
                 f"ℹ️ *{dep_city or outbound_dep} ↔ {arr_city or outbound_arr} 항공권 알림*", "",
@@ -1046,18 +1412,23 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 f"• 오는 편 시간: {format_time_range(user_config, 'inbound')}",
                 "시간 설정을 변경하시려면 /settings 명령어를 사용해주세요.", "",
                 f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-                f"🔗 네이버 항공권: {naver_link}"
+                f"🔗 [네이버 항공권 바로가기]({naver_link})"
             ]
-            await context.bot.send_message(user_id, "\n".join(msg_lines), parse_mode="Markdown")
+            try:
+                await context.bot.send_message(
+                    user_id, 
+                    "\n".join(msg_lines), 
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            except Exception as send_error:
+                logger.error(f"항공권 없음 알림 전송 실패 ({hist_path.name}): {send_error}")
     except NoFlightDataException:
         logger.warning(f"monitor_job: 항공권 정보 없음 (아마도 경로 문제) - {hist_path.name}")
-        # Consider notifying the user or admin, or removing the job if this persists.
-        # For now, it will just update the state with no prices.
     except Exception as ex:
         logger.error(f"monitor_job 실행 중 오류 발생 ({hist_path.name}): {ex}", exc_info=True)
 
-    # Update state file: use current prices if found, otherwise keep old ones (or 0 if never found)
-    current_user_config = get_user_config(user_id) # Get latest config for storing
+    current_user_config = await get_user_config_async(user_id)
     new_state_data = {
         "start_time": state.get("start_time"),
         "restricted": restricted if restricted is not None else old_restr,
@@ -1068,7 +1439,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
     }
     logger.debug(f"[{hist_path.name}] 상태 저장 시도: {new_state_data}")
     try:
-        save_json_data(hist_path, new_state_data)
+        await save_json_data_async(hist_path, new_state_data)
         logger.info(f"[{hist_path.name}] 상태 저장 및 last_fetch 업데이트 성공. 새 last_fetch: {new_state_data.get('last_fetch')}")
     except Exception as e_save:
         logger.error(f"CRITICAL: [{hist_path.name}] monitor_job 실행 후 상태 파일 저장 실패: {e_save}", exc_info=True)
@@ -1077,10 +1448,17 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"사용자 {user_id} 요청: /status")
-    files = sorted([
-        p for p in DATA_DIR.iterdir()
-        if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
-    ])
+    
+    # 비동기적으로 파일 목록 가져오기
+    loop = asyncio.get_running_loop()
+    files = await loop.run_in_executor(
+        file_executor,
+        lambda: sorted([
+            p for p in DATA_DIR.iterdir()
+            if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
+        ])
+    )
+    
     if not files:
         await update.message.reply_text(
             "현재 실행 중인 모니터링이 없습니다."
@@ -1093,13 +1471,12 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for idx, hist_file_path in enumerate(files, start=1):
         try:
             info = PATTERN.fullmatch(hist_file_path.name).groupdict()
-            data = load_json_data(hist_file_path)
+            data = await load_json_data_async(hist_file_path)
             start_dt = datetime.strptime(
                 data['start_time'], '%Y-%m-%d %H:%M:%S'
             ).replace(tzinfo=KST)
             elapsed = (now - start_dt).days
             
-            # 공항 정보 가져오기
             dep, arr = info['dep'], info['arr']
             _, dep_city, _ = get_airport_info(dep)
             _, arr_city, _ = get_airport_info(arr)
@@ -1107,12 +1484,9 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             arr_city = arr_city or arr
             
             dd, rd = info['dd'], info['rd']
-            
-            # 날짜 형식 변환 (YYYYMMDD -> YY.MM.DD)
             dd_fmt = f"{dd[2:4]}.{dd[4:6]}.{dd[6:]}"
             rd_fmt = f"{rd[2:4]}.{rd[4:6]}.{rd[6:]}"
             
-            # 최저가 정보 구성
             prices = []
             if data['restricted']:
                 prices.append(f"조건부: {data['restricted']:,}원")
@@ -1134,11 +1508,8 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         except json.JSONDecodeError:
             logger.warning(f"Status: JSON decode error for {hist_file_path.name}, skipping.")
-            # Optionally inform user about this specific entry
-            # ...
             continue
 
-    # status 명령어 실행 시 키보드 유지
     keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
     await update.message.reply_text(
         "\n".join(msg_lines),
@@ -1466,7 +1837,7 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
                 continue
 
             try:
-                data = load_json_data(hist_path) # Consistent locking
+                data = await load_json_data_async(hist_path) # Consistent locking
             except json.JSONDecodeError:
                 logger.error(f"모니터링 복원 중 JSON 디코딩 오류 ({hist_path.name}). 파일 삭제 시도.")
                 try: hist_path.unlink()
@@ -1622,7 +1993,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
     for file_path in DATA_DIR.glob("price_*.json"):
         try:
             # Use load_json_data for consistent locking
-            data = load_json_data(file_path)
+            data = await load_json_data_async(file_path)
             start_time_str = data.get("start_time")
             if not start_time_str:
                 logger.warning(f"데이터 정리 중 'start_time' 누락: {file_path.name}, 파일 삭제 시도.")
@@ -1737,6 +2108,13 @@ async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+async def cleanup_resources():
+    """리소스 정리"""
+    logger.info("리소스 정리 시작...")
+    selenium_manager.shutdown()
+    file_executor.shutdown(wait=True)
+    logger.info("리소스 정리 완료")
+
 def main():
     logger.info("메인 함수 시작: ApplicationBuilder 설정 중...")
     
@@ -1795,8 +2173,13 @@ def main():
     logger.info("봇 실행 시작")
     # 시작 시 on_startup 함수 직접 실행
     asyncio.get_event_loop().run_until_complete(on_startup(application))
-    # 봇 실행
-    application.run_polling()
+    
+    try:
+        # 봇 실행
+        application.run_polling()
+    finally:
+        # 종료 시 리소스 정리
+        asyncio.get_event_loop().run_until_complete(cleanup_resources())
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,4 @@
-selenium
+selenium==4.16.0
 requests
-python-telegram-bot[job-queue]>=22.0
+python-telegram-bot==20.7
+aiohttp==3.9.1
