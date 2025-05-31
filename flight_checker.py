@@ -20,8 +20,6 @@ import json
 import time as time_module
 import logging
 import asyncio
-import fcntl
-import contextlib
 from pathlib import Path
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
@@ -47,142 +45,34 @@ import sys
 import threading
 from typing import Optional, Tuple, Dict, Any, Literal # Literal 추가
 
-# 알림 조건 타입 정의
-NotificationPreferenceType = Literal[
-    "PRICE_DROP_THRESHOLD",  # 설정된 값 이상 가격 하락 시 알림 (기본)
-    "PRICE_DROP_ANY",        # 1원이라도 가격 하락 시 알림
-    "ANY_PRICE_CHANGE",      # 가격 상승 또는 하락 시 모두 알림
-    "TARGET_PRICE_REACHED",  # 사용자가 설정한 목표 가격 이하 도달 시 알림
-    "HISTORICAL_LOW_UPDATED" # 모니터링 시작 이후 가장 낮은 가격 갱신 시 알림
-]
+# ConfigManager import
+from config_manager import config_manager, NotificationPreferenceType
 
-# 알림 조건 기본값
-DEFAULT_NOTIFICATION_PREFERENCE: NotificationPreferenceType = "PRICE_DROP_THRESHOLD"
-DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT = 5000
-DEFAULT_NOTIFICATION_TARGET_PRICE = None
+# TelegramBot import
+from telegram_bot import TelegramBot, MessageManager, SETTING
 
-# 안전한 메시지 편집 함수
-async def safe_edit_message(
-    message: Message, 
-    text: str, 
-    parse_mode: str = None,
-    reply_markup=None,
-    disable_web_page_preview: bool = True,
-    max_retries: int = 3
-) -> Optional[Message]:
-    """
-    안전한 메시지 편집 함수
-    - 편집 불가능한 경우 새 메시지 발송
-    - 네트워크 에러 시 재시도
-    """
-    for attempt in range(max_retries):
-        try:
-            return await message.edit_text(
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                disable_web_page_preview=disable_web_page_preview
-            )
-        except BadRequest as e:
-            error_msg = str(e).lower()
-            
-            if "message can't be edited" in error_msg:
-                logger.warning(f"메시지 편집 불가, 새 메시지 발송: {e}")
-                try:
-                    return await message.reply_text(
-                        text=text,
-                        parse_mode=parse_mode,
-                        reply_markup=reply_markup,
-                        disable_web_page_preview=disable_web_page_preview
-                    )
-                except Exception as reply_error:
-                    logger.error(f"새 메시지 발송도 실패: {reply_error}")
-                    return None
-            
-            elif "message is not modified" in error_msg:
-                logger.debug("메시지 내용이 동일하여 편집하지 않음")
-                return message
-            
-            elif attempt < max_retries - 1:
-                logger.warning(f"메시지 편집 재시도 {attempt + 1}/{max_retries}: {e}")
-                await asyncio.sleep(1)
-                continue
-            else:
-                logger.error(f"메시지 편집 최종 실패: {e}")
-                return None
-                
-        except (TimedOut, NetworkError) as e:
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # 지수 백오프
-                logger.warning(f"네트워크 에러, {wait_time}초 후 재시도: {e}")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"네트워크 에러 최종 실패: {e}")
-                return None
-        
-        except Exception as e:
-            logger.error(f"예상치 못한 에러: {e}")
-            return None
-    
-    return None
+# ConfigManager에서 설정값들을 가져옴
+TIME_PERIODS = config_manager.TIME_PERIODS
+DEFAULT_USER_CONFIG = config_manager.DEFAULT_USER_CONFIG
+DEFAULT_NOTIFICATION_PREFERENCE = config_manager.DEFAULT_NOTIFICATION_PREFERENCE
+DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT = config_manager.DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT
+DEFAULT_NOTIFICATION_TARGET_PRICE = config_manager.DEFAULT_NOTIFICATION_TARGET_PRICE
+DATA_DIR = config_manager.DATA_DIR
+LOG_DIR = config_manager.LOG_DIR
+LOG_FILE = config_manager.LOG_FILE
+USER_CONFIG_DIR = config_manager.USER_CONFIG_DIR
+AIRPORTS_JSON_PATH = config_manager.AIRPORTS_JSON_PATH
+BOT_TOKEN = config_manager.BOT_TOKEN
+SELENIUM_HUB_URL = config_manager.SELENIUM_HUB_URL
+USER_AGENT = config_manager.USER_AGENT
+DATA_RETENTION_DAYS = config_manager.DATA_RETENTION_DAYS
+CONFIG_RETENTION_DAYS = config_manager.CONFIG_RETENTION_DAYS
+FILE_WORKERS = config_manager.FILE_WORKERS
+KST = ZoneInfo("Asia/Seoul")
 
-# 메시지 상태 관리 클래스
-class MessageManager:
-    def __init__(self):
-        # 사용자별 상태 메시지 추적
-        self.status_messages: Dict[int, Message] = {}
-        # 메시지 편집 잠금 (동시 편집 방지)
-        self.edit_locks: Dict[str, asyncio.Lock] = {}
-    
-    def get_lock(self, message_key: str) -> asyncio.Lock:
-        """메시지별 편집 잠금 반환"""
-        if message_key not in self.edit_locks:
-            self.edit_locks[message_key] = asyncio.Lock()
-        return self.edit_locks[message_key]
-    
-    async def update_status_message(
-        self, 
-        user_id: int, 
-        text: str, 
-        parse_mode: str = "Markdown",
-        reply_markup=None
-    ) -> Optional[Message]:
-        """사용자별 상태 메시지 업데이트"""
-        message_key = f"status_{user_id}"
-        
-        async with self.get_lock(message_key):
-            current_message = self.status_messages.get(user_id)
-            
-            if current_message:
-                # 기존 메시지 편집 시도
-                updated_message = await safe_edit_message(
-                    current_message, 
-                    text, 
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup
-                )
-                
-                if updated_message:
-                    self.status_messages[user_id] = updated_message
-                    return updated_message
-                else:
-                    # 편집 실패 시 새 메시지로 교체
-                    del self.status_messages[user_id]
-            
-            return None
-    
-    def set_status_message(self, user_id: int, message: Message):
-        """상태 메시지 등록"""
-        self.status_messages[user_id] = message
-    
-    def clear_status_message(self, user_id: int):
-        """상태 메시지 제거"""
-        if user_id in self.status_messages:
-            del self.status_messages[user_id]
-
-# 전역 메시지 매니저
-message_manager = MessageManager()
+# 전역 텔레그램 봇 인스턴스
+telegram_bot = TelegramBot()
+message_manager = telegram_bot.message_manager
 
 # Selenium 작업 관리를 위한 전용 매니저 클래스
 class SeleniumManager:
@@ -322,203 +212,53 @@ class SeleniumManager:
 
 # 전역 Selenium 매니저 인스턴스 생성
 selenium_manager = SeleniumManager(
-    max_workers=int(os.getenv("SELENIUM_WORKERS", "5")),
-    grid_url=os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub"),
-    user_agent=os.getenv("USER_AGENT")
+    max_workers=config_manager.MAX_WORKERS,
+    grid_url=config_manager.SELENIUM_HUB_URL,
+    user_agent=config_manager.USER_AGENT
 )
 
 # 파일 작업용 executor
-FILE_WORKERS = int(os.getenv("FILE_WORKERS", "5"))
 file_executor = ThreadPoolExecutor(max_workers=FILE_WORKERS, thread_name_prefix="file")
-
-# --- 설정 및 초기화 ---
-# 테스트 환경에서는 FLIGHT_CHECKER_TEST_DATA_DIR 환경 변수를 사용하여 DATA_DIR 경로를 오버라이드할 수 있음
-data_dir_path_str = os.getenv("FLIGHT_CHECKER_TEST_DATA_DIR")
-if data_dir_path_str:
-    DATA_DIR = Path(data_dir_path_str)
-else:
-    DATA_DIR = Path("/data")
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-LOG_DIR = DATA_DIR / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "flight_bot.log"
-
-# 사용자 설정 디렉토리
-USER_CONFIG_DIR = DATA_DIR / "user_configs"
-USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-# 공항 데이터 파일 경로 (테스트 시 패치 가능하도록 변수화)
-AIRPORTS_JSON_PATH = Path(__file__).resolve().parent / "data" / "airports.json"
-
-# 시간대 설정
-TIME_PERIODS = {
-    "새벽": (0, 6),    # 00:00 ~ 06:00
-    "오전1": (6, 9),   # 06:00 ~ 09:00
-    "오전2": (9, 12),  # 09:00 ~ 12:00
-    "오후1": (12, 15), # 12:00 ~ 15:00
-    "오후2": (15, 18), # 15:00 ~ 18:00
-    "밤1": (18, 21),   # 18:00 ~ 21:00
-    "밤2": (21, 24),   # 21:00 ~ 00:00
-}
-
-# 기본 설정값
-DEFAULT_USER_CONFIG = {
-    "time_type": "time_period",        # 'time_period' 또는 'exact'
-    "outbound_periods": ["오전1", "오전2"],  # 가는 편 시간대
-    "inbound_periods": ["오후1", "오후2", "밤1"],  # 오는 편 시간대
-    "outbound_exact_hour": 9,          # 가는 편 시각 (시간 단위)
-    "inbound_exact_hour": 15,          # 오는 편 시각 (시간 단위)
-    "last_activity": None,             # 마지막 활동 시간
-    "created_at": None,                # 설정 생성 시간
-    "notification_preference": DEFAULT_NOTIFICATION_PREFERENCE, # 알림 조건
-    "notification_threshold_amount": DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT, # 가격 하락 알림 기준 금액
-    "notification_target_price": DEFAULT_NOTIFICATION_TARGET_PRICE, # 목표 가격
-    "notification_interval": 30,        # 기본값: 30분
-}
 
 async def load_json_data_async(file_path: Path) -> dict:
     """비동기 JSON 데이터 로드"""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(file_executor, load_json_data, file_path)
+    return await loop.run_in_executor(file_executor, config_manager.load_json_data, file_path)
 
 async def save_json_data_async(file_path: Path, data: dict):
     """비동기 JSON 데이터 저장"""
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(file_executor, save_json_data, file_path, data)
+    await loop.run_in_executor(file_executor, config_manager.save_json_data, file_path, data)
 
 async def save_user_config_async(user_id: int, config: dict):
     """비동기 사용자 설정 저장"""
-    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    # last_activity는 호출하는 쪽에서 미리 업데이트하거나, 여기서 업데이트
-    config['last_activity'] = format_datetime(datetime.now())
-    if 'created_at' not in config or not config['created_at']:
-        config['created_at'] = format_datetime(datetime.now())
-    await save_json_data_async(config_file, config)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(file_executor, config_manager.save_user_config, user_id, config)
 
 async def get_user_config_async(user_id: int) -> dict:
     """비동기 사용자 설정 로드. 내부적으로 동기 함수 get_user_config 호출."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(file_executor, get_user_config, user_id)
+    return await loop.run_in_executor(file_executor, config_manager.get_user_config, user_id)
 
 def get_user_config(user_id: int) -> dict:
-    """사용자 설정을 로드하거나 기본값을 생성하여 반환합니다.
-    
-    설정 파일이 존재하면 로드하고, last_activity를 현재 시간으로 갱신 후 저장합니다.
-    파일이 없거나 오류 발생 시 기본 설정을 생성하고 저장합니다.
-    """
-    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    
-    try:
-        if config_file.exists():
-            with file_lock(config_file):
-                data = json.loads(config_file.read_text(encoding='utf-8'))
-                # 마지막 활동 시간 업데이트
-                data['last_activity'] = format_datetime(datetime.now())
-                # 변경된 내용을 다시 파일에 씀
-                config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-                return data
-    except Exception as e:
-        logger.error(f"사용자 설정 로드 중 오류 (ID: {user_id}, 파일: {config_file}): {e}")
-        # 오류 발생 시에도 기본 설정으로 복구 시도 (아래 로직에서 처리)
-
-    # 설정 파일이 없거나 로드 중 오류 발생 시 기본값으로 생성 및 저장
-    logger.info(f"기본 사용자 설정 생성 (ID: {user_id}, 파일: {config_file})")
-    default_config = DEFAULT_USER_CONFIG.copy()
-    default_config['created_at'] = format_datetime(datetime.now())
-    default_config['last_activity'] = format_datetime(datetime.now())
-    
-    try:
-        # save_user_config 함수를 사용하지 않고 직접 저장 (순환 호출 방지 및 로직 명확화)
-        with file_lock(config_file):
-            config_file.write_text(json.dumps(default_config, ensure_ascii=False, indent=2), encoding='utf-8')
-    except Exception as e_save:
-        logger.error(f"기본 사용자 설정 저장 실패 (ID: {user_id}, 파일: {config_file}): {e_save}")
-        # 저장 실패 시 메모리상의 기본 설정이라도 반환
-
-    return default_config
+    """사용자 설정을 로드하거나 기본값을 생성하여 반환합니다."""
+    return config_manager.get_user_config(user_id)
 
 def save_user_config(user_id: int, config: dict):
-    """사용자 설정을 저장합니다.
-    
-    last_activity와 created_at (없는 경우)을 현재 시간으로 설정 후 저장합니다.
-    """
-    config_file = USER_CONFIG_DIR / f"config_{user_id}.json"
-    config['last_activity'] = format_datetime(datetime.now())
-    if 'created_at' not in config or not config['created_at']:
-        config['created_at'] = format_datetime(datetime.now())
-    
-    save_json_data(config_file, config) # 파일 잠금과 함께 저장
+    """사용자 설정을 저장합니다."""
+    config_manager.save_user_config(user_id, config)
 
 def get_time_range(config: dict, direction: str) -> tuple[time, time]:
-    """시간 범위를 반환합니다.
-    
-    Args:
-        config: 사용자 설정
-        direction: 'outbound' 또는 'inbound'
-        
-    Returns:
-        tuple[time, time]: 시작 시각과 종료 시각
-    """
-    if config['time_type'] == 'time_period':
-        periods = config[f'{direction}_periods']
-        period_ranges = [TIME_PERIODS[p] for p in periods]
-        
-        if direction == 'outbound':
-            # 가는 편: 선택한 시간대들의 각각의 범위를 모두 체크
-            return None, None  # 시간대는 개별 체크하도록 None 반환
-        else:
-            # 오는 편: 선택한 시간대들의 각각의 범위를 모두 체크
-            return None, None  # 시간대는 개별 체크하도록 None 반환
-    else:  # exact
-        hour = config[f'{direction}_exact_hour']
-        if direction == 'outbound':
-            # 가는 편은 "이전"이므로 정확한 시각이 끝 시각
-            return time(hour=0, minute=0), time(hour=hour, minute=0)
-        else:
-            # 오는 편은 "이후"이므로 정확한 시각이 시작 시각
-            return time(hour=hour, minute=0), time(hour=23, minute=59)
+    """시간 범위를 반환합니다."""
+    return config_manager.get_time_range(config, direction)
 
 def format_time_range(config: dict, direction: str) -> str:
     """시간 설정을 문자열로 변환합니다."""
-    if config['time_type'] == 'time_period':
-        periods = config[f'{direction}_periods']
-        period_ranges = [TIME_PERIODS[p] for p in periods]
-        start_hours = [start for start, _ in period_ranges]
-        end_hours = [end for _, end in period_ranges]
-        period_str = ", ".join(periods)
-        
-        if direction == 'outbound':
-            return f"{period_str} ({min(start_hours):02d}:00-{max(end_hours):02d}:00)"
-        else:
-            # 오는 편은 선택한 시간대들을 모두 표시
-            time_ranges = [f"{start:02d}:00-{end:02d}:00" for start, end in period_ranges]
-            return f"{period_str} ({' / '.join(time_ranges)})"
-    else:  # exact
-        hour = config[f'{direction}_exact_hour']
-        return f"{hour:02d}:00 {'이전' if direction == 'outbound' else '이후'}"
+    return config_manager.format_time_range(config, direction)
 
 def format_notification_setting(config: dict) -> str:
     """알림 설정을 문자열로 변환합니다."""
-    pref = config.get("notification_preference", DEFAULT_NOTIFICATION_PREFERENCE)
-    threshold = config.get("notification_threshold_amount", DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT)
-    target_price = config.get("notification_target_price", DEFAULT_NOTIFICATION_TARGET_PRICE)
-
-    if pref == "PRICE_DROP_THRESHOLD":
-        return f"가격 {threshold:,}원 이상 하락 시"
-    elif pref == "PRICE_DROP_ANY":
-        return "가격 하락 시 (금액 무관)"
-    elif pref == "ANY_PRICE_CHANGE":
-        return "가격 변동 시 (상승/하락 모두)"
-    elif pref == "TARGET_PRICE_REACHED":
-        if target_price:
-            return f"목표 가격 {target_price:,}원 이하 도달 시"
-        else:
-            return "목표 가격 도달 시 (목표가 미설정)"
-    elif pref == "HISTORICAL_LOW_UPDATED":
-        return "역대 최저가 갱신 시"
-    return "알 수 없는 설정"
+    return config_manager.format_notification_setting(config)
 
 async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """사용자 설정 확인 및 변경"""
@@ -562,11 +302,9 @@ async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 새벽 (00-06), 오전1 (06-09)",
         "• 오전2 (09-12), 오후1 (12-15)",
         "• 오후2 (15-18), 밤1 (18-21)",
-        "• 밤2 (21-24)"
-    ]
-    
-    # 관리자 여부에 따라 다른 키보드 표시
-    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+        "• 밤2 (21-24)"    ]
+      # 관리자 여부에 따라 다른 키보드 표시
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
     await update.message.reply_text(
         "\n".join(msg_lines),
         parse_mode="Markdown",
@@ -721,21 +459,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❗ 설정 변경에 실패했습니다. 올바른 명령어인지 확인해주세요."
         )
 
-# 로그 파일 크기 제한 (10MB)
-MAX_LOG_SIZE = 10 * 1024 * 1024
-
-def rotate_logs():
-    """로그 파일 로테이션"""
-    if not LOG_FILE.exists() or LOG_FILE.stat().st_size < MAX_LOG_SIZE:
-        return
-    
-    for i in range(4, 0, -1):
-        old = LOG_FILE.with_suffix(f'.log.{i}')
-        new = LOG_FILE.with_suffix(f'.log.{i+1}')
-        if old.exists():
-            old.rename(new)
-    if LOG_FILE.exists():
-        LOG_FILE.rename(LOG_FILE.with_suffix('.log.1'))
+# Removed rotate_logs function - using config_manager.setup_logging method
 
 # logging.basicConfig(...) # 여기서 로깅 설정 제거
 # rotate_logs() # 여기서 호출 제거
@@ -743,22 +467,9 @@ def rotate_logs():
 # 로거 인스턴스는 모듈 레벨에서 생성 유지
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logger.error("환경변수 BOT_TOKEN이 설정되어 있지 않습니다.")
-    raise RuntimeError("BOT_TOKEN이 필요합니다.")
-
-SELENIUM_HUB_URL = os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub")
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-)
-# 사용자당 최대 모니터링 개수
-MAX_MONITORS = int(os.getenv("MAX_MONITORS", "3"))
-
-raw_admin = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = set(int(p.strip()) for p in raw_admin.split(",") if p.strip().isdigit())
+# 기존 환경변수 상수들을 config_manager로 교체
+# BOT_TOKEN, SELENIUM_HUB_URL, USER_AGENT, MAX_MONITORS, ADMIN_IDS 등은 
+# config_manager에서 관리되므로 직접 정의하지 않음
 
 KST = ZoneInfo("Asia/Seoul")
 SETTING = 1
@@ -768,8 +479,7 @@ PATTERN = re.compile(
     r"price_(?P<uid>\d+)_(?P<dep>[A-Z]{3})_(?P<arr>[A-Z]{3})_(?P<dd>\d{8})_(?P<rd>\d{8})\.json"
 )
 
-def format_datetime(dt: datetime) -> str:
-    return dt.astimezone(KST).strftime('%Y-%m-%d %H:%M:%S')
+# Removed format_datetime - using config_manager.format_datetime method
 
 def parse_flight_info(text: str, depart: str, arrive: str) -> tuple[str, str, str, str, int] | None:
     """항공편 정보 파싱
@@ -899,55 +609,16 @@ async def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_r
 
     return await _fetch_with_retry()
 
-# 도움말 텍스트
-async def help_text(user_id: int = None) -> str:
-    admin_help = ""
-    if ADMIN_IDS and user_id in ADMIN_IDS:
-        admin_help = (
-            "\n\n👑 *관리자 명령어*\n"
-            "• /allstatus - 전체 모니터링 현황\n"
-            "• /allcancel - 전체 모니터링 취소"
-        )
-    
-    return (
-        "✈️ *항공권 최저가 모니터링 봇*\n"
-        "\n"
-        "📝 *기본 명령어*\n"
-        "• /monitor - 새로운 모니터링 시작\n"
-        "• /status - 모니터링 현황 확인\n"
-        "• /cancel - 모니터링 취소\n"
-        "\n"
-        "⚙️ *설정 명령어*\n"
-        "• /settings - 시간 제한 설정\n"
-        "• /airport - 공항 코드 목록"
-        + admin_help
-    )
+# 도움말 텍스트는 telegram_bot 모듈로 이동됨
 
-def get_base_keyboard() -> ReplyKeyboardMarkup:
-    """기본 키보드 버튼 생성"""
-    keyboard = [
-        [KeyboardButton("/monitor"), KeyboardButton("/status")],
-        [KeyboardButton("/settings"), KeyboardButton("/airport")],
-        [KeyboardButton("/cancel"), KeyboardButton("/help")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_admin_keyboard() -> ReplyKeyboardMarkup:
-    """관리자용 키보드 버튼 생성"""
-    keyboard = [
-        [KeyboardButton("/monitor"), KeyboardButton("/status")],
-        [KeyboardButton("/settings"), KeyboardButton("/airport")],
-        [KeyboardButton("/cancel"), KeyboardButton("/help")],
-        [KeyboardButton("/allstatus"), KeyboardButton("/allcancel")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+# 키보드 관련 함수들은 telegram_bot 모듈로 이동됨
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /start")
     # 관리자 여부에 따라 다른 키보드 표시
-    keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(update.effective_user.id)
     await update.message.reply_text(
-        await help_text(update.effective_user.id),
+        await telegram_bot.help_text(update.effective_user.id),
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -955,9 +626,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /help")
     # 관리자 여부에 따라 다른 키보드 표시
-    keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(update.effective_user.id)
     await update.message.reply_text(
-        await help_text(update.effective_user.id),
+        await telegram_bot.help_text(update.effective_user.id),
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -977,49 +648,7 @@ def validate_url(url: str) -> tuple[bool, str]:
     except Exception:
         return False, "URL 파싱 중 오류가 발생했습니다"
 
-def validate_env_vars() -> list[str]:
-    """환경변수 검증
-    Returns:
-        list[str]: 오류 메시지 목록
-    """
-    errors = []
-    
-    # 필수 환경변수
-    if not os.getenv("BOT_TOKEN"):
-        errors.append("BOT_TOKEN이 설정되지 않았습니다")
-        
-    # Selenium Hub URL 검증
-    selenium_url = os.getenv("SELENIUM_HUB_URL", "http://localhost:4444/wd/hub")
-    is_valid, error_msg = validate_url(selenium_url)
-    if not is_valid:
-        errors.append(f"SELENIUM_HUB_URL이 올바르지 않습니다: {error_msg}")
-        
-    # 관리자 ID 검증
-    admin_ids = os.getenv("ADMIN_IDS", "")
-    if admin_ids:
-        for admin_id in admin_ids.split(","):
-            if admin_id.strip() and not admin_id.strip().isdigit():
-                errors.append(f"ADMIN_IDS에 올바르지 않은 ID가 포함되어 있습니다: {admin_id}")
-        
-    # 숫자형 환경변수 검증
-    for var_name, default, min_val in [
-        ("MAX_MONITORS", "3", 1),
-        ("DATA_RETENTION_DAYS", "30", 1),
-        ("CONFIG_RETENTION_DAYS", "7", 1)
-    ]:
-        try:
-            value = int(os.getenv(var_name, default))
-            if value < min_val:
-                errors.append(f"{var_name}는 {min_val} 이상이어야 합니다")
-        except ValueError:
-            errors.append(f"{var_name}가 올바른 숫자가 아닙니다")
-        
-    # 로그 레벨 환경변수 검증
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    if log_level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
-        errors.append(f"LOG_LEVEL이 올바르지 않습니다: {log_level}. (DEBUG, INFO, WARNING, ERROR, CRITICAL 중 하나여야 합니다)")
-        
-    return errors
+# Removed validate_env_vars - using config_manager.validate_env_vars method
 
 # 명령어 속도 제한
 class RateLimiter:
@@ -1063,15 +692,13 @@ def rate_limit(func):
 @rate_limit
 async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"사용자 {user_id} 요청: /monitor")
-    
-    # 현재 모니터링 개수 확인
+    logger.info(f"사용자 {user_id} 요청: /monitor")      # 현재 모니터링 개수 확인
     existing = [p for p in DATA_DIR.iterdir() if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id]
-    if len(existing) >= MAX_MONITORS:
+    if len(existing) >= config_manager.MAX_MONITORS:
         logger.warning(f"사용자 {user_id} 최대 모니터링 초과")
-        keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+        keyboard = telegram_bot.get_keyboard_for_user(user_id)
         await update.message.reply_text(
-            f"❗ 최대 {MAX_MONITORS}개까지 모니터링할 수 있습니다.\n"
+            f"❗ 최대 {config_manager.MAX_MONITORS}개까지 모니터링할 수 있습니다.\n"
             "새로운 모니터링을 추가하려면 먼저 기존 모니터링을 취소해주세요.",
             reply_markup=keyboard
         )
@@ -1202,7 +829,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Cancels and ends the current conversation."""
     user_id = update.effective_user.id
     logger.info(f"User {user_id} canceled the conversation.")
-    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
     await update.message.reply_text(
         '진행 중이던 설정 작업을 취소했습니다.', reply_markup=keyboard
     )
@@ -1211,7 +838,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Modified monitor_setting function for better flow
 async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    final_keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+    final_keyboard = telegram_bot.get_keyboard_for_user(user_id)
     text = update.message.text.strip().split()
 
     if len(text) != 4:
@@ -1236,8 +863,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 항공권 정보를 조회하는 중입니다...\n⏳ 잠시만 기다려주세요.",
         reply_markup=None
     )
-    
-    # 메시지 매니저에 등록
+      # 메시지 매니저에 등록
     message_manager.set_status_message(user_id, status_message)
     
     try:
@@ -1250,11 +876,11 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     int(PATTERN.fullmatch(p.name).group('uid')) == user_id]
         )
         
-        if len(existing) >= MAX_MONITORS:
+        if len(existing) >= config_manager.MAX_MONITORS:
             logger.warning(f"사용자 {user_id} 최대 모니터링 초과")
             await message_manager.update_status_message(
                 user_id,
-                f"❗ 최대 {MAX_MONITORS}개까지 모니터링할 수 있습니다.",
+                f"❗ 최대 {config_manager.MAX_MONITORS}개까지 모니터링할 수 있습니다.",
                 reply_markup=final_keyboard
             )
             return ConversationHandler.END
@@ -1293,14 +919,14 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         # 모니터링 설정 저장
         hist_path = DATA_DIR / f"price_{user_id}_{outbound_dep}_{outbound_arr}_{outbound_date}_{inbound_date}.json"
-        start_time = format_datetime(datetime.now())
+        start_time = config_manager.format_datetime(datetime.now())
         user_config = await get_user_config_async(user_id)
         
         await save_json_data_async(hist_path, {
             "start_time": start_time,
             "restricted": restricted or 0,
             "overall": overall or 0,
-            "last_fetch": format_datetime(datetime.now()),
+            "last_fetch": config_manager.format_datetime(datetime.now()),
             "time_setting_outbound": format_time_range(user_config, 'outbound'),
             "time_setting_inbound": format_time_range(user_config, 'inbound')
         })
@@ -1497,7 +1123,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         "start_time": state.get("start_time"),
         "restricted": restricted if restricted is not None else old_restr,
         "overall": overall if overall is not None else old_overall,
-        "last_fetch": format_datetime(datetime.now()),
+        "last_fetch": config_manager.format_datetime(datetime.now()),
         "time_setting_outbound": format_time_range(current_user_config, 'outbound'),
         "time_setting_inbound": format_time_range(current_user_config, 'inbound')
     }
@@ -1546,7 +1172,6 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _, arr_city, _ = get_airport_info(arr)
             dep_city = dep_city or dep # 도시 정보가 없으면 공항 코드로 대체
             arr_city = arr_city or arr # 도시 정보가 없으면 공항 코드로 대체
-            
             dd, rd = info['dd'], info['rd']
             dd_fmt = f"{dd[2:4]}.{dd[4:6]}.{dd[6:]}"
             rd_fmt = f"{rd[2:4]}.{rd[4:6]}.{rd[6:]}"
@@ -1574,7 +1199,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Status: JSON decode error for {hist_file_path.name}, skipping.")
             continue
 
-    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
     await update.message.reply_text(
         "\n".join(msg_lines),
         parse_mode="Markdown",
@@ -1586,15 +1211,13 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"사용자 {user_id} 요청: /cancel")
-    
-    # 모니터링 파일 찾기
+      # 모니터링 파일 찾기
     files = sorted([
-        p for p in DATA_DIR.iterdir()
+    p for p in DATA_DIR.iterdir()
         if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
     ])
-    
     if not files:
-        keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+        keyboard = telegram_bot.get_keyboard_for_user(user_id)
         await update.message.reply_text(
             "현재 실행 중인 모니터링이 없습니다.\n"
             "새로운 모니터링을 시작하려면 /monitor 명령을 사용하세요.",
@@ -1656,10 +1279,9 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
     logger.info(f"사용자 {user_id} 콜백: {data}")
-    
     monitors = ctx.application.bot_data.get("monitors", {})
     user_mons = monitors.get(user_id, [])
-    keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_base_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
 
     if data == "cancel_all":
         files = [
@@ -1738,7 +1360,7 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"관리자 {user_id} 요청: /allstatus")
-    if user_id not in ADMIN_IDS:
+    if user_id not in config_manager.ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
 
@@ -1789,7 +1411,7 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"관리자 {user_id} 요청: /allcancel")
-    if user_id not in ADMIN_IDS:
+    if user_id not in config_manager.ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
 
@@ -1823,17 +1445,17 @@ async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     
-    if user_id not in ADMIN_IDS:
+    if user_id not in config_manager.ADMIN_IDS:
         await query.answer("❌ 관리자 권한이 필요합니다.")
         return
-        
+    
     if query.data == "cancel_allcancel":
         # 인라인 키보드 제거
         await query.message.edit_text(
             "모니터링 취소가 취소되었습니다."
         )
         # 새로운 메시지로 관리자 키보드 표시
-        keyboard = get_admin_keyboard()
+        keyboard = telegram_bot.get_keyboard_for_user(query.from_user.id)
         await query.message.reply_text(
             "다른 작업을 선택해주세요.",
             reply_markup=keyboard
@@ -1881,13 +1503,12 @@ async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg_parts = [f"✅ 전체 모니터링 종료: {count}건 처리됨"]
     if error_count > 0:
         msg_parts.append(f"⚠️ {error_count}건의 오류 발생")
-    
-    # 인라인 키보드 제거
+      # 인라인 키보드 제거
     await query.message.edit_text(
         "\n".join(msg_parts)
     )
     # 새로운 메시지로 관리자 키보드 표시
-    keyboard = get_admin_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(query.from_user.id)
     await query.message.reply_text(
         "다른 작업을 선택해주세요.",
         reply_markup=keyboard
@@ -1963,7 +1584,7 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
             if delta.total_seconds() < 0: # last_fetch가 미래 시간인 경우 (시스템 시간 변경 등)
                 next_run_delay = interval
                 logger.warning(
-                    f"last_fetch가 미래 시간 ({hist_path.name}): {format_datetime(last_fetch)}. "
+                    f"last_fetch가 미래 시간 ({hist_path.name}): {config_manager.format_datetime(last_fetch)}. "
                     f"다음 정기 실행은 {next_run_delay.total_seconds()/60:.1f}분 후로 예약합니다."
                 )
             else:
@@ -1974,7 +1595,7 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
 
             # logger.info(
             #     f"정기 모니터링 등록: {hist_path.name} | "
-            #     f"Last Fetch: {last_fetch_str if last_fetch_str else 'N/A'} | Now: {format_datetime(now)} | Delta: {delta.total_seconds()/60:.1f}분 | "
+            #     f"Last Fetch: {last_fetch_str if last_fetch_str else 'N/A'} | Now: {config_manager.format_datetime(now)} | Delta: {delta.total_seconds()/60:.1f}분 | "
             #     f"다음 실행까지 약: {next_run_delay.total_seconds()/60:.1f}분"
             # ) # 상세 로그는 유지하거나 필요시 주석 해제
 
@@ -2016,36 +1637,13 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
 
     logger.info(f"모니터링 복원 완료: 총 {processed_files}개 파일 처리, {active_jobs_restored}개 작업 활성/재개됨.")
 
-@contextlib.contextmanager
-def file_lock(file_path):
-    """파일 잠금을 위한 컨텍스트 매니저"""
-    lock_path = str(file_path) + '.lock'
-    with open(lock_path, 'w') as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            if os.path.exists(lock_path):
-                os.unlink(lock_path)
-
-def save_json_data(file_path: Path, data: dict):
-    """스레드 세이프한 JSON 데이터 저장"""
-    with file_lock(file_path):
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-def load_json_data(file_path: Path) -> dict:
-    """스레드 세이프한 JSON 데이터 로드"""
-    with file_lock(file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+# Removed file_lock, save_json_data, load_json_data - using config_manager methods
 
 # Modified cleanup_old_data function signature and body
 async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context argument
     """오래된 모니터링 데이터와 설정 파일 정리"""
-    retention_days = int(os.getenv("DATA_RETENTION_DAYS", "30"))
-    config_retention_days = int(os.getenv("CONFIG_RETENTION_DAYS", "7"))
+    retention_days = config_manager.DATA_RETENTION_DAYS
+    config_retention_days = config_manager.CONFIG_RETENTION_DAYS
     cutoff_date = datetime.now(KST) - timedelta(days=retention_days)
     config_cutoff_date = datetime.now(KST) - timedelta(days=config_retention_days)
 
@@ -2053,7 +1651,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
     config_deleted = 0
 
     # 오래된 모니터링 데이터 정리
-    for file_path in DATA_DIR.glob("price_*.json"):
+    for file_path in config_manager.DATA_DIR.glob("price_*.json"):
         try:
             # Use load_json_data for consistent locking
             data = await load_json_data_async(file_path)
@@ -2089,10 +1687,9 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
             logger.warning(f"데이터 정리 중 오류 발생 ({file_path.name}): {ex}")
 
     # 오래된 설정 파일 정리
-    for config_file in USER_CONFIG_DIR.glob("config_*.json"):
+    for config_file in config_manager.USER_CONFIG_DIR.glob("config_*.json"):
         try:
-            # file_lock is already part of load_json_data, but user config has custom load/save
-            # Use async load for consistency and proper locking via load_json_data_async -> load_json_data -> file_lock
+            # Use async load for consistency and proper locking
             if not config_file.exists(): continue # Might have been deleted
 
             data = await load_json_data_async(config_file) # 비동기 로드 및 잠금
@@ -2101,8 +1698,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
             if not last_activity_str:
                 logger.warning(f"설정 파일 정리 중 'last_activity' 또는 'created_at' 누락: {config_file.name}, 파일 삭제 시도.")
                 try:
-                    with file_lock(config_file): # 삭제 전 잠금
-                        if config_file.exists(): config_file.unlink()
+                    if config_file.exists(): config_file.unlink()
                     config_deleted += 1
                 except OSError as e:
                     logger.error(f"오래된 설정 파일 삭제 실패 '{config_file.name}': {e}")
@@ -2124,30 +1720,28 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
                 loop = asyncio.get_running_loop()
                 active_monitors = await loop.run_in_executor(
                     file_executor, 
-                    lambda: [p for p in DATA_DIR.glob(f"price_{user_id}_*.json") if p.exists()]
+                    lambda: [p for p in config_manager.DATA_DIR.glob(f"price_{user_id}_*.json") if p.exists()]
                 )
 
                 if not active_monitors:
                     logger.info(f"비활성 사용자 설정 삭제: {config_file.name}")
                     try:
-                        with file_lock(config_file): # 삭제 전 잠금
-                            if config_file.exists(): config_file.unlink()
+                        if config_file.exists(): config_file.unlink()
                         config_deleted += 1
                     except OSError as e:
                         logger.error(f"비활성 사용자 설정 파일 삭제 실패 '{config_file.name}': {e}")
         except json.JSONDecodeError:
             logger.warning(f"설정 파일 정리 중 JSON 디코딩 오류: {config_file.name}, 파일 삭제 시도.")
             try:
-                with file_lock(config_file): # ensure lock for deletion if it still exists
-                    if config_file.exists():
-                         config_file.unlink()
-                         config_deleted +=1
+                if config_file.exists():
+                     config_file.unlink()
+                     config_deleted +=1
             except OSError as e:
                 logger.error(f"손상된 설정 파일 삭제 실패 '{config_file.name}': {e}")
         except Exception as ex:
             logger.warning(f"설정 파일 정리 중 오류 발생 ({config_file.name}): {ex}")
 
-    if ADMIN_IDS and (monitor_deleted > 0 or config_deleted > 0) : # Only notify if changes were made
+    if config_manager.ADMIN_IDS and (monitor_deleted > 0 or config_deleted > 0) : # Only notify if changes were made
         msg = (
             "🧹 *데이터 정리 완료*\n"
             f"• 삭제된 모니터링: {monitor_deleted}건\n"
@@ -2155,7 +1749,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
             f"모니터링 보관 기간: {retention_days}일\n"
             f"설정 파일 보관 기간: {config_retention_days}일"
         )
-        for admin_id in ADMIN_IDS:
+        for admin_id in config_manager.ADMIN_IDS:
             try:
                 await context.bot.send_message( # Use context.bot
                     chat_id=admin_id,
@@ -2169,7 +1763,7 @@ async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """등록된 주요 공항 코드 목록을 보여줍니다."""
     logger.info(f"사용자 {update.effective_user.id} 요청: /airport")
     # airport 명령어 실행 시 키보드 유지
-    keyboard = get_admin_keyboard() if update.effective_user.id in ADMIN_IDS else get_base_keyboard()
+    keyboard = telegram_bot.get_keyboard_for_user(update.effective_user.id)
     await update.message.reply_text(
         format_airport_list(),
         parse_mode="Markdown",
@@ -2184,29 +1778,13 @@ async def cleanup_resources():
     logger.info("리소스 정리 완료")
 
 def main():
-    # main 함수 시작 부분에 로그 로테이션 및 로깅 설정 추가
-    rotate_logs()
-
-    # 로그 레벨 설정
-    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
-    log_level = getattr(logging, log_level_str, logging.INFO)
-
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler()
-        ]
-    )
-
-    # httpx 로거의 레벨을 WARNING으로 설정하여 INFO 로그 비활성화
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # config_manager로 로깅 설정 및 환경변수 검증
+    config_manager.setup_logging()
 
     logger.info("텔레그램 봇 애플리케이션 시작 중...")
     
     # 환경변수 검증
-    errors = validate_env_vars()
+    errors = config_manager.validate_env_vars()
     if errors:
         for error in errors:
             logger.error(error)
@@ -2214,12 +1792,12 @@ def main():
         logger.error("환경변수 설정 오류로 인해 봇을 시작할 수 없습니다.")
         return # main 함수 종료
     
-    if not BOT_TOKEN:
+    if not config_manager.BOT_TOKEN:
         # 이 경우는 validate_env_vars에서 이미 처리되지만, 추가 방어 코드
         logger.error("환경변수 BOT_TOKEN이 설정되어 있지 않습니다. 봇을 시작할 수 없습니다.")
         return # main 함수 종료
     
-    application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    application = ApplicationBuilder().token(config_manager.BOT_TOKEN).concurrent_updates(True).build()
     
     # 작업 디렉토리 생성 (DATA_DIR은 이미 상단에서 생성 시도됨, USER_CONFIG_DIR 등)
     # DATA_DIR.mkdir(parents=True, exist_ok=True) # 중복될 수 있으므로 확인
@@ -2244,13 +1822,12 @@ def main():
     application.add_handler(CommandHandler("airport", airport_cmd))
     application.add_handler(CommandHandler("settings", settings_cmd))
     application.add_handler(CommandHandler("set", set_cmd))
-    
-    # 콜백 쿼리 핸들러 추가 (패턴이 더 구체적인 것을 먼저 등록)
+      # 콜백 쿼리 핸들러 추가 (패턴이 더 구체적인 것을 먼저 등록)
     application.add_handler(CallbackQueryHandler(all_cancel_callback, pattern="^(confirm|cancel)_allcancel$"))
     application.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel_"))
     
     # 관리자 명령어
-    if ADMIN_IDS:
+    if config_manager.ADMIN_IDS:
         application.add_handler(CommandHandler("allstatus", all_status))
         application.add_handler(CommandHandler("allcancel", all_cancel))
     

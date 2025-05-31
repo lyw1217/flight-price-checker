@@ -73,9 +73,8 @@ class TestFlightChecker(unittest.TestCase):
         # 로거 패치 시작 (모듈 로드 이후)
         cls.logger_patcher = patch.object(cls.flight_checker_module, 'logger', MagicMock())
         cls.logger_patcher.start()
-        
-        # 필요한 심볼들을 클래스 변수에 할당
-        cls.MessageManager = cls.flight_checker_module.MessageManager
+          # 필요한 심볼들을 클래스 변수에 할당
+        cls.MessageManager = cls.flight_checker_module.message_manager.__class__  # telegram_bot 모듈의 MessageManager
         cls.validate_url = cls.flight_checker_module.validate_url
         cls.parse_flight_info = cls.flight_checker_module.parse_flight_info
         cls.check_time_restrictions = cls.flight_checker_module.check_time_restrictions
@@ -87,7 +86,7 @@ class TestFlightChecker(unittest.TestCase):
         cls.get_time_range = cls.flight_checker_module.get_time_range
         cls.DEFAULT_USER_CONFIG = cls.flight_checker_module.DEFAULT_USER_CONFIG
         cls.TIME_PERIODS = cls.flight_checker_module.TIME_PERIODS
-        cls.format_datetime = cls.flight_checker_module.format_datetime
+        cls.format_datetime = cls.flight_checker_module.config_manager.format_datetime  # config_manager에서 가져옴
         cls.AIRPORTS_loaded = cls.flight_checker_module.AIRPORTS
         cls.user_configs_path_class = cls.flight_checker_module.USER_CONFIG_DIR
         cls.logs_path_class = cls.flight_checker_module.LOG_DIR
@@ -189,14 +188,19 @@ class TestFlightChecker(unittest.TestCase):
         future_date = (today + timedelta(days=30)).strftime("%Y%m%d")
         past_date = (today - timedelta(days=1)).strftime("%Y%m%d")
         far_future = (today + timedelta(days=400)).strftime("%Y%m%d")
-        is_valid, _ = self.valid_date(future_date); self.assertTrue(is_valid)
-        is_valid, _ = self.valid_date(past_date); self.assertFalse(is_valid)
-        is_valid, _ = self.valid_date(far_future); self.assertFalse(is_valid)
-        is_valid, _ = self.valid_date("invalid"); self.assertFalse(is_valid)
-
-    @patch('flight_checker.save_json_data')
-    @patch('flight_checker.load_json_data')
-    def test_get_and_save_user_config(self, mock_load_json_data, mock_save_json_data):
+        
+        is_valid, _ = self.valid_date(future_date)
+        self.assertTrue(is_valid)
+        is_valid, _ = self.valid_date(past_date)
+        self.assertFalse(is_valid)
+        is_valid, _ = self.valid_date(far_future)
+        self.assertFalse(is_valid)
+        is_valid, _ = self.valid_date("invalid")
+        self.assertFalse(is_valid)
+    
+    @patch('flight_checker.config_manager.load_json_data')
+    @patch('flight_checker.config_manager.save_json_data')
+    def test_get_and_save_user_config(self, mock_save_json_data, mock_load_json_data):
         """사용자 설정 로드 및 저장 테스트"""
         mock_load_json_data.side_effect = FileNotFoundError
         with patch.object(Path, 'exists', return_value=False), \
@@ -246,17 +250,25 @@ class TestFlightChecker(unittest.TestCase):
         self.assertEqual(self.format_time_range(period_config, 'outbound'), "오전1, 오전2 (06:00-12:00)")
         self.assertEqual(self.format_time_range(period_config, 'inbound'), "오후2, 밤1 (15:00-18:00 / 18:00-21:00)")
         exact_config = {"time_type": "exact", "outbound_exact_hour": 8, "inbound_exact_hour": 17}
-        self.assertEqual(self.format_time_range(exact_config, 'outbound'), "08:00 이전")
-        self.assertEqual(self.format_time_range(exact_config, 'inbound'), "17:00 이후")
+        self.assertEqual(self.format_time_range(exact_config, 'outbound'), "08:00 이전 출발")
+        self.assertEqual(self.format_time_range(exact_config, 'inbound'), "17:00 이후 출발")
 
     def test_get_time_range(self):
         """시간 범위 반환 테스트"""
         period_config = {"time_type": "time_period", "outbound_periods": ["오전1"], "inbound_periods": ["오후1"]}
-        start_time, end_time = self.get_time_range(period_config, 'outbound'); self.assertIsNone(start_time); self.assertIsNone(end_time)
-        start_time, end_time = self.get_time_range(period_config, 'inbound'); self.assertIsNone(start_time); self.assertIsNone(end_time)
+        start_time, end_time = self.get_time_range(period_config, 'outbound')
+        self.assertIsNone(start_time)
+        self.assertIsNone(end_time)
+        start_time, end_time = self.get_time_range(period_config, 'inbound')
+        self.assertIsNone(start_time)
+        self.assertIsNone(end_time)
         exact_config = {"time_type": "exact", "outbound_exact_hour": 10, "inbound_exact_hour": 14}
-        start_time, end_time = self.get_time_range(exact_config, 'outbound'); self.assertEqual(start_time, time(hour=0, minute=0)); self.assertEqual(end_time, time(hour=10, minute=0))
-        start_time, end_time = self.get_time_range(exact_config, 'inbound'); self.assertEqual(start_time, time(hour=14, minute=0)); self.assertEqual(end_time, time(hour=23, minute=59))
+        start_time, end_time = self.get_time_range(exact_config, 'outbound')
+        self.assertEqual(start_time, time(hour=0, minute=0))
+        self.assertEqual(end_time, time(hour=10, minute=0))
+        start_time, end_time = self.get_time_range(exact_config, 'inbound')
+        self.assertEqual(start_time, time(hour=14, minute=0))
+        self.assertEqual(end_time, time(hour=23, minute=59))
 
     async def helper_test_message_manager_update(self, existing_message_text=None, new_text="New Text", should_edit_fail=False, should_reply_fail=False):
         user_id = self.test_user_id
@@ -275,9 +287,8 @@ class TestFlightChecker(unittest.TestCase):
             new_msg = MagicMock(); new_msg.text = kwargs.get('text'); return new_msg
         mock_message.edit_text = MagicMock(side_effect=mock_edit_text)
         mock_message.reply_text = MagicMock(side_effect=mock_reply_text)
-        
-        # safe_edit_message를 AsyncMock으로 패치
-        with patch.object(self.flight_checker_module, 'safe_edit_message', new_callable=AsyncMock) as mock_safe_edit:
+          # telegram_bot의 safe_edit_message를 AsyncMock으로 패치
+        with patch.object(self.flight_checker_module.telegram_bot, 'safe_edit_message', new_callable=AsyncMock) as mock_safe_edit:
             if existing_message_text:
                 if should_edit_fail:
                     if should_reply_fail:
@@ -297,7 +308,11 @@ class TestFlightChecker(unittest.TestCase):
                 # 따라서 mock_safe_edit.return_value = None 설정 불필요
                 pass 
 
-            updated_message = await self.message_manager.update_status_message(user_id, new_text)
+            updated_message = await self.message_manager.update_status_message(
+                user_id, 
+                new_text, 
+                telegram_bot=self.flight_checker_module.telegram_bot
+            )
             
             if existing_message_text:
                 mock_safe_edit.assert_called_once()
@@ -318,12 +333,16 @@ class TestFlightChecker(unittest.TestCase):
 
     def test_message_manager_update_existing_success(self):
         asyncio.run(self.helper_test_message_manager_update(existing_message_text="Old Text"))
+    
     def test_message_manager_update_existing_edit_fail_reply_success(self):
         asyncio.run(self.helper_test_message_manager_update(existing_message_text="Old Text", should_edit_fail=True))
+    
     def test_message_manager_update_existing_edit_fail_reply_fail(self):
         asyncio.run(self.helper_test_message_manager_update(existing_message_text="Old Text", should_edit_fail=True, should_reply_fail=True))
+    
     def test_message_manager_update_no_existing_message(self):
         asyncio.run(self.helper_test_message_manager_update(new_text="New Text"))
+    
     def test_message_manager_set_and_clear(self):
         user_id = self.test_user_id
         mock_message = MagicMock()
