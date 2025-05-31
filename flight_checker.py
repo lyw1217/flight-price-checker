@@ -37,6 +37,7 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from telegram import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram.error import BadRequest, TimedOut, NetworkError
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -44,8 +45,21 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sys
 import threading
-from typing import Optional, Tuple, Dict, Any
-from telegram.error import BadRequest, TimedOut, NetworkError
+from typing import Optional, Tuple, Dict, Any, Literal # Literal 추가
+
+# 알림 조건 타입 정의
+NotificationPreferenceType = Literal[
+    "PRICE_DROP_THRESHOLD",  # 설정된 값 이상 가격 하락 시 알림 (기본)
+    "PRICE_DROP_ANY",        # 1원이라도 가격 하락 시 알림
+    "ANY_PRICE_CHANGE",      # 가격 상승 또는 하락 시 모두 알림
+    "TARGET_PRICE_REACHED",  # 사용자가 설정한 목표 가격 이하 도달 시 알림
+    "HISTORICAL_LOW_UPDATED" # 모니터링 시작 이후 가장 낮은 가격 갱신 시 알림
+]
+
+# 알림 조건 기본값
+DEFAULT_NOTIFICATION_PREFERENCE: NotificationPreferenceType = "PRICE_DROP_THRESHOLD"
+DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT = 5000
+DEFAULT_NOTIFICATION_TARGET_PRICE = None
 
 # 안전한 메시지 편집 함수
 async def safe_edit_message(
@@ -357,7 +371,11 @@ DEFAULT_USER_CONFIG = {
     "outbound_exact_hour": 9,          # 가는 편 시각 (시간 단위)
     "inbound_exact_hour": 15,          # 오는 편 시각 (시간 단위)
     "last_activity": None,             # 마지막 활동 시간
-    "created_at": None                 # 설정 생성 시간
+    "created_at": None,                # 설정 생성 시간
+    "notification_preference": DEFAULT_NOTIFICATION_PREFERENCE, # 알림 조건
+    "notification_threshold_amount": DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT, # 가격 하락 알림 기준 금액
+    "notification_target_price": DEFAULT_NOTIFICATION_TARGET_PRICE, # 목표 가격
+    "notification_interval": 30,        # 기본값: 30분
 }
 
 async def load_json_data_async(file_path: Path) -> dict:
@@ -481,19 +499,46 @@ def format_time_range(config: dict, direction: str) -> str:
         hour = config[f'{direction}_exact_hour']
         return f"{hour:02d}:00 {'이전' if direction == 'outbound' else '이후'}"
 
+def format_notification_setting(config: dict) -> str:
+    """알림 설정을 문자열로 변환합니다."""
+    pref = config.get("notification_preference", DEFAULT_NOTIFICATION_PREFERENCE)
+    threshold = config.get("notification_threshold_amount", DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT)
+    target_price = config.get("notification_target_price", DEFAULT_NOTIFICATION_TARGET_PRICE)
+
+    if pref == "PRICE_DROP_THRESHOLD":
+        return f"가격 {threshold:,}원 이상 하락 시"
+    elif pref == "PRICE_DROP_ANY":
+        return "가격 하락 시 (금액 무관)"
+    elif pref == "ANY_PRICE_CHANGE":
+        return "가격 변동 시 (상승/하락 모두)"
+    elif pref == "TARGET_PRICE_REACHED":
+        if target_price:
+            return f"목표 가격 {target_price:,}원 이하 도달 시"
+        else:
+            return "목표 가격 도달 시 (목표가 미설정)"
+    elif pref == "HISTORICAL_LOW_UPDATED":
+        return "역대 최저가 갱신 시"
+    return "알 수 없는 설정"
+
 async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """사용자 설정 확인 및 변경"""
     user_id = update.effective_user.id
     config = await get_user_config_async(user_id)
     
     msg_lines = [
-        "⚙️ *시간 제한 설정*",
+        "⚙️ *시간 제한 및 알림 설정*",
         "",
-        "*현재 설정*",
+        "*현재 시간 설정*",
         f"• 가는 편: {format_time_range(config, 'outbound')}",
         f"• 오는 편: {format_time_range(config, 'inbound')}",
         "",
-        "*설정 방법*",
+        "*현재 알림 설정*",
+        f"• 알림 조건: {format_notification_setting(config)}",
+        "",
+        "*현재 알림 주기 설정*",
+        f"• 알림 주기: {config.get('notification_interval', 30)}분",
+        "",
+        "*시간 설정 방법*",
         "1️⃣ *시간대로 설정* (해당 시간대의 항공편만 검색)",
         "• 가는 편: `/set 가는편 시간대 오전1 오전2`",
         "• 오는 편: `/set 오는편 시간대 오후1 오후2 밤1`",
@@ -501,6 +546,17 @@ async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "2️⃣ *특정 시각으로 설정*",
         "• 가는 편: `/set 가는편 시각 9` (09:00 이전 출발)",
         "• 오는 편: `/set 오는편 시각 15` (15:00 이후 출발)",
+        "",
+        "*알림 설정 방법*",
+        f"• 기본: `/set 알림조건 기본` ({DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT:,}원 이상 하락 시)",
+        f"• 하락 시: `/set 알림조건 하락시` (금액 무관)",
+        f"• 변동 시: `/set 알림조건 변동시` (상승/하락 모두)",
+        f"• 목표가: `/set 알림조건 목표가 150000` (15만원 이하 시)",
+        f"• 역대최저가: `/set 알림조건 역대최저가`",
+        f"• 하락기준 변경: `/set 알림조건 하락기준 3000` (3천원 이상 하락 시)",
+        "",
+        "*알림 주기 설정 방법*",
+        "• `/set 알림주기 15` (15분마다 알림)",
         "",
         "*시간대 구분*",
         "• 새벽 (00-06), 오전1 (06-09)",
@@ -522,63 +578,148 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = update.message.text.strip().split()
     
-    if len(args) < 4:
+    if len(args) < 3: # 명령어, 설정종류, 값 (최소 3개)
         await update.message.reply_text(
             "❗ 올바른 형식으로 입력해주세요.\n"
             "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
         )
         return
     
-    _, direction, set_type, *values = args
+    command, target_type, *values = args # command는 /set, target_type은 '가는편', '오는편', '알림조건' 등
     
-    if direction not in ["가는편", "오는편"]:
-        await update.message.reply_text("❗ '가는편' 또는 '오는편'만 설정 가능합니다.")
-        return
-    
-    direction = "outbound" if direction == "가는편" else "inbound"
     config = await get_user_config_async(user_id)
-    
-    if set_type == "시각":
-        if len(values) != 1 or not values[0].isdigit():
-            await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
-            return
-            
-        hour = int(values[0])
-        if hour < 0 or hour > 23:
-            await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
-            return
-            
-        config['time_type'] = 'exact'
-        config[f'{direction}_exact_hour'] = hour
-        
-    elif set_type == "시간대":
-        if not values:
-            await update.message.reply_text("❗ 하나 이상의 시간대를 선택해주세요.")
-            return
-            
-        invalid_periods = [p for p in values if p not in TIME_PERIODS]
-        if invalid_periods:
+    action_taken_msg = ""
+
+    if target_type in ["가는편", "오는편"]:
+        if len(values) < 2: # 시각/시간대, 값 (최소 2개)
             await update.message.reply_text(
-                f"❗ 올바르지 않은 시간대: {', '.join(invalid_periods)}\n"
+                "❗ 시간 설정 형식이 올바르지 않습니다.\n"
                 "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
             )
             return
+
+        direction_str = target_type
+        set_type, *time_values = values
+        direction = "outbound" if direction_str == "가는편" else "inbound"
+
+        if set_type == "시각":
+            if len(time_values) != 1 or not time_values[0].isdigit():
+                await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
+                return
             
-        config['time_type'] = 'time_period'
-        config[f'{direction}_periods'] = values
+            hour = int(time_values[0])
+            if hour < 0 or hour > 23:
+                await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
+                return
+            
+            config['time_type'] = 'exact'
+            config[f'{direction}_exact_hour'] = hour
+            action_taken_msg = f"✅ {direction_str} 시간 설정이 변경되었습니다: {format_time_range(config, direction)}"
+            
+        elif set_type == "시간대":
+            if not time_values:
+                await update.message.reply_text("❗ 하나 이상의 시간대를 선택해주세요.")
+                return
+            
+            invalid_periods = [p for p in time_values if p not in TIME_PERIODS]
+            if invalid_periods:
+                await update.message.reply_text(
+                    f"❗ 올바르지 않은 시간대: {', '.join(invalid_periods)}\n"
+                    "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                )
+                return
+            
+            config['time_type'] = 'time_period'
+            config[f'{direction}_periods'] = time_values
+            action_taken_msg = f"✅ {direction_str} 시간 설정이 변경되었습니다: {format_time_range(config, direction)}"
+            
+        else:
+            await update.message.reply_text(
+                "❗ 시간 설정은 '시각' 또는 '시간대'로만 가능합니다.\n"
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            )
+            return
+
+    elif target_type == "알림조건":
+        if not values: # 최소한 '기본' 등의 값이 있어야 함
+            await update.message.reply_text(
+                "❗ 알림 조건을 입력해주세요.\n"
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            )
+            return
         
+        pref_type = values[0]
+        
+        if pref_type == "기본":
+            config["notification_preference"] = DEFAULT_NOTIFICATION_PREFERENCE
+            config["notification_threshold_amount"] = DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT
+            config["notification_target_price"] = DEFAULT_NOTIFICATION_TARGET_PRICE
+        elif pref_type == "하락시":
+            config["notification_preference"] = "PRICE_DROP_ANY"
+        elif pref_type == "변동시":
+            config["notification_preference"] = "ANY_PRICE_CHANGE"
+        elif pref_type == "역대최저가":
+            config["notification_preference"] = "HISTORICAL_LOW_UPDATED"
+        elif pref_type == "목표가":
+            if len(values) < 2 or not values[1].isdigit():
+                await update.message.reply_text("❗ 목표 가격을 숫자로 입력해주세요. 예: `/set 알림조건 목표가 150000`")
+                return
+            target_price = int(values[1])
+            if target_price <= 0:
+                await update.message.reply_text("❗ 목표 가격은 0보다 커야 합니다.")
+                return
+            config["notification_preference"] = "TARGET_PRICE_REACHED"
+            config["notification_target_price"] = target_price
+        elif pref_type == "하락기준":
+            if len(values) < 2 or not values[1].isdigit():
+                await update.message.reply_text("❗ 하락 기준 금액을 숫자로 입력해주세요. 예: `/set 알림조건 하락기준 3000`")
+                return
+            threshold = int(values[1])
+            if threshold < 0: # 0원 하락도 의미는 있으나, 혼동 방지. 보통 양수로 입력.
+                await update.message.reply_text("❗ 하락 기준 금액은 0 이상이어야 합니다.")
+                return
+            config["notification_preference"] = "PRICE_DROP_THRESHOLD" # 하락기준 변경 시 자동으로 이 타입으로 설정
+            config["notification_threshold_amount"] = threshold
+        else:
+            await update.message.reply_text(
+                f"❗ 알 수 없는 알림 조건 타입: {pref_type}\n"
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            )
+            return
+        action_taken_msg = f"✅ 알림 조건이 변경되었습니다: {format_notification_setting(config)}"
+
+    elif target_type == "알림주기":
+        if len(values) != 1 or not values[0].isdigit():
+            await update.message.reply_text(
+                "❗ 알림 주기는 숫자로 입력해주세요.\n"
+                "예: `/set 알림주기 15` (15분마다 알림)"
+            )
+            return
+
+        interval = int(values[0])
+        if interval < 5 or interval > 1440:  # 5분 ~ 24시간 제한
+            await update.message.reply_text(
+                "❗ 알림 주기는 5분 이상, 1440분 이하로 설정해주세요."
+            )
+            return
+
+        config['notification_interval'] = interval
+        action_taken_msg = f"✅ 알림 주기가 {interval}분으로 설정되었습니다."
+
     else:
         await update.message.reply_text(
-            "❗ '시각' 또는 '시간대'로만 설정 가능합니다.\n"
+            f"❗ 알 수 없는 설정 타입: {target_type}\n"
             "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
         )
         return
-    
-    await save_user_config_async(user_id, config)
-    await update.message.reply_text(
-        f"✅ {direction=='outbound'and'가는 편'or'오는 편'} 설정이 변경되었습니다:\n"
-        f"{format_time_range(config, direction)}"
-    )
+
+    if action_taken_msg: # 변경 사항이 있을 때만 저장 및 메시지 응답
+        await save_user_config_async(user_id, config)
+        await update.message.reply_text(action_taken_msg)
+    else:
+        await update.message.reply_text(
+            "❗ 설정 변경에 실패했습니다. 올바른 명령어인지 확인해주세요."
+        )
 
 # 로그 파일 크기 제한 (10MB)
 MAX_LOG_SIZE = 10 * 1024 * 1024
@@ -1310,7 +1451,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         if price_change_occurred:
             notify_msg_lines.extend([
                 "", f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-                "🔗 네이버 항공권:", link
+                f"🔗 [네이버 항공권]({link})"
             ])
             try:
                 await context.bot.send_message(
@@ -1335,7 +1476,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 f"• 오는 편 시간: {format_time_range(user_config, 'inbound')}",
                 "시간 설정을 변경하시려면 /settings 명령어를 사용해주세요.", "",
                 f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
-                f"🔗 [네이버 항공권 바로가기]({naver_link})"
+                f"🔗 [네이버 항공권]({naver_link})"
             ]
             try:
                 await context.bot.send_message(
@@ -1395,10 +1536,10 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             info = PATTERN.fullmatch(hist_file_path.name).groupdict()
             data = await load_json_data_async(hist_file_path)
-            start_dt = datetime.strptime(
+            start_time = datetime.strptime(
                 data['start_time'], '%Y-%m-%d %H:%M:%S'
             ).replace(tzinfo=KST)
-            elapsed = (now - start_dt).days
+            elapsed = (now - start_time).days
             
             dep, arr = info['dep'], info['arr']
             _, dep_city, _ = get_airport_info(dep)
