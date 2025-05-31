@@ -1846,7 +1846,9 @@ def main():
         application.run_polling()
     finally:
         # 종료 시 리소스 정리
-        asyncio.get_event_loop().run_until_complete(cleanup_resources())
+        if not asyncio.get_event_loop().is_closed():
+            asyncio.get_event_loop().run_until_complete(cleanup_resources())
+        asyncio.get_event_loop().close()
 
 if __name__ == "__main__":
     main()
