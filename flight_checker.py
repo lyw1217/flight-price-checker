@@ -93,6 +93,7 @@ class SeleniumManager:
     
     def setup_driver(self) -> webdriver.Remote:
         """브라우저 드라이버 설정"""
+        logger.info(f"[SeleniumManager] setup_driver 진입 (grid_url={self.grid_url}, user_agent={self.user_agent})")
         options = webdriver.ChromeOptions()
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
@@ -101,19 +102,22 @@ class SeleniumManager:
         options.add_argument('--window-size=1920,1080')
         if self.user_agent:
             options.add_argument(f'user-agent={self.user_agent}')
-        
-        if self.grid_url:
-            # Selenium Grid 사용
-            driver = webdriver.Remote(
-                command_executor=self.grid_url,
-                options=options
-            )
-        else:
-            # 로컬 ChromeDriver 사용
-            driver = webdriver.Chrome(options=options)
-        
-        return driver
-    
+        try:
+            if self.grid_url:
+                logger.info(f"[SeleniumManager] Remote WebDriver 생성 시도: {self.grid_url}")
+                driver = webdriver.Remote(
+                    command_executor=self.grid_url,
+                    options=options
+                )
+            else:
+                logger.info("[SeleniumManager] Local ChromeDriver 생성 시도")
+                driver = webdriver.Chrome(options=options)
+            logger.info("[SeleniumManager] WebDriver 생성 완료")
+            return driver
+        except Exception as e:
+            logger.error(f"[SeleniumManager] WebDriver 생성 실패: {e}", exc_info=True)
+            raise
+
     def _fetch_single(self, url: str, depart: str, arrive: str, config: dict) -> Tuple[Any, str, Any, str, str]:
         """단일 조회 실행 (동기 함수)"""
         with self.lock:
@@ -128,7 +132,9 @@ class SeleniumManager:
             overall_price, restricted_price = None, None
             overall_info, restricted_info = "", ""
             
+            logger.info(f"[SeleniumManager] driver.get 호출 준비: {url}")
             driver.get(url)
+            logger.info(f"[SeleniumManager] driver.get 완료: {url}")
             WebDriverWait(driver, 40).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="inlineFilter_FilterWrapper__"]'))
             )
@@ -182,11 +188,15 @@ class SeleniumManager:
             return restricted_price, restricted_info, overall_price, overall_info, url
             
         except Exception as e:
-            logger.error(f"Selenium 작업 #{task_id} 실패: {e}")
+            logger.error(f"Selenium 작업 #{task_id} 실패: {e}", exc_info=True)
             raise
         finally:
             if driver:
-                driver.quit()
+                try:
+                    driver.quit()
+                    logger.info(f"[SeleniumManager] WebDriver quit 완료 (task_id={task_id})")
+                except Exception as quit_e:
+                    logger.error(f"[SeleniumManager] WebDriver quit 중 오류: {quit_e}", exc_info=True)
             with self.lock:
                 self.active_tasks -= 1
 
@@ -881,7 +891,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await message_manager.update_status_message(
                 user_id,
                 f"❗ 최대 {config_manager.MAX_MONITORS}개까지 모니터링할 수 있습니다.",
-                reply_markup=final_keyboard
+                reply_markup=final_keyboard,
+                telegram_bot=telegram_bot
             )
             return ConversationHandler.END
 
@@ -896,7 +907,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # 진행 상황 업데이트
         await message_manager.update_status_message(
             user_id,
-            f"🔍 {dep_city} → {arr_city} 항공권 조회 중...\n⏳ 네이버 항공권에서 정보를 가져오고 있습니다."
+            f"🔍 {dep_city} → {arr_city} 항공권 조회 중...\n⏳ 네이버 항공권에서 정보를 가져오고 있습니다.",
+            telegram_bot=telegram_bot
         )
         
         # 가격 조회 (시간이 오래 걸리는 작업)
@@ -913,7 +925,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await message_manager.update_status_message(
                 user_id,
                 f"❌ 항공권 조회 중 오류가 발생했습니다.\n\n🔸 {str(fetch_error)}\n\n다시 시도해 주세요.",
-                reply_markup=final_keyboard
+                reply_markup=final_keyboard,
+                telegram_bot=telegram_bot
             )
             return ConversationHandler.END
         
@@ -984,7 +997,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             user_id,
             "\n".join(msg_lines),
             parse_mode="Markdown",
-            reply_markup=final_keyboard
+            reply_markup=final_keyboard,
+            telegram_bot=telegram_bot
         )
         
         if not final_result:
@@ -1001,7 +1015,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await message_manager.update_status_message(
             user_id,
             f"❌ 처리 중 오류가 발생했습니다.\n{str(e)}",
-            reply_markup=final_keyboard
+            reply_markup=final_keyboard,
+            telegram_bot=telegram_bot
         )
     
     finally:
