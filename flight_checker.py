@@ -16,16 +16,12 @@
 """
 import re
 import json
-import time as time_module
 import logging
 import asyncio
-import sys
 from pathlib import Path
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from collections import defaultdict
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
@@ -34,15 +30,25 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from telegram import ReplyKeyboardRemove
-from typing import Optional, Tuple
 
-from config_manager import config_manager, NotificationPreferenceType
+from config_manager import config_manager
 
-from telegram_bot import TelegramBot, MessageManager, SETTING
+from telegram_bot import TelegramBot, SETTING
 
 from selenium_manager import (
     SeleniumManager, NoFlightDataException, NoMatchingFlightsException,
     parse_flight_info, check_time_restrictions, fetch_prices
+)
+
+from utils import (
+    load_json_data_async, save_json_data_async, save_user_config_async, get_user_config_async,
+    get_user_config, save_user_config,
+    get_time_range, format_time_range, format_notification_setting,
+    validate_url, valid_date, valid_airport,
+    load_airports, get_airport_info, format_airport_list, AIRPORTS,
+    RateLimiter, rate_limiter, rate_limit,
+    cleanup_utils_resources,
+    file_executor
 )
 
 # ConfigManager에서 설정값들 가져오기
@@ -73,48 +79,6 @@ selenium_manager = SeleniumManager(
     grid_url=config_manager.SELENIUM_HUB_URL,
     user_agent=config_manager.USER_AGENT
 )
-
-file_executor = ThreadPoolExecutor(max_workers=FILE_WORKERS, thread_name_prefix="file")
-
-async def load_json_data_async(file_path: Path) -> dict:
-    """비동기 JSON 데이터 로드"""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(file_executor, config_manager.load_json_data, file_path)
-
-async def save_json_data_async(file_path: Path, data: dict):
-    """비동기 JSON 데이터 저장"""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(file_executor, config_manager.save_json_data, file_path, data)
-
-async def save_user_config_async(user_id: int, config: dict):
-    """비동기 사용자 설정 저장"""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(file_executor, config_manager.save_user_config, user_id, config)
-
-async def get_user_config_async(user_id: int) -> dict:
-    """비동기 사용자 설정 로드. 내부적으로 동기 함수 get_user_config 호출."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(file_executor, config_manager.get_user_config, user_id)
-
-def get_user_config(user_id: int) -> dict:
-    """사용자 설정을 로드하거나 기본값을 생성하여 반환합니다."""
-    return config_manager.get_user_config(user_id)
-
-def save_user_config(user_id: int, config: dict):
-    """사용자 설정을 저장합니다."""
-    config_manager.save_user_config(user_id, config)
-
-def get_time_range(config: dict, direction: str) -> tuple[time, time]:
-    """시간 범위를 반환합니다."""
-    return config_manager.get_time_range(config, direction)
-
-def format_time_range(config: dict, direction: str) -> str:
-    """시간 설정을 문자열로 변환합니다."""
-    return config_manager.format_time_range(config, direction)
-
-def format_notification_setting(config: dict) -> str:
-    """알림 설정을 문자열로 변환합니다."""
-    return config_manager.format_notification_setting(config)
 
 async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """사용자 설정 확인 및 변경"""
@@ -345,60 +309,6 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-def validate_url(url: str) -> tuple[bool, str]:
-    """URL 유효성 검사
-    Returns:
-        tuple[bool, str]: (유효성 여부, 오류 메시지)
-    """
-    try:
-        result = urlparse(url)
-        if not all([result.scheme, result.netloc]):
-            return False, "URL 형식이 올바르지 않습니다"
-        if result.scheme not in ["http", "https"]:
-            return False, "URL은 http 또는 https로 시작해야 합니다"
-        return True, ""
-    except Exception:
-        return False, "URL 파싱 중 오류가 발생했습니다"
-
-# 명령어 속도 제한
-class RateLimiter:
-    def __init__(self, max_calls: int, time_window: float):
-        self.max_calls = max_calls
-        self.time_window = time_window
-        self.calls = defaultdict(list)
-        
-    def is_allowed(self, user_id: int) -> bool:
-        """사용자의 명령어 실행 허용 여부 확인"""
-        now = time_module.time()
-        user_calls = self.calls[user_id]
-        
-        # 시간 창 밖의 기록 제거
-        while user_calls and now - user_calls[0] > self.time_window:
-            user_calls.pop(0)
-            
-        if len(user_calls) >= self.max_calls:
-            return False
-            
-        user_calls.append(now)
-        return True
-
-# 속도 제한 설정 (1분에 10회)
-rate_limiter = RateLimiter(max_calls=10, time_window=60)
-
-def rate_limit(func):
-    """명령어 속도 제한 데코레이터"""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        
-        if not rate_limiter.is_allowed(user_id):
-            await update.message.reply_text(
-                "❗ 너무 많은 명령어를 실행했습니다. 잠시 후 다시 시도해주세요."
-            )
-            return
-            
-        return await func(update, context)
-    return wrapper
-
 @rate_limit
 async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -431,110 +341,6 @@ async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return SETTING
 
-# 유효 날짜 체크
-from datetime import datetime as _dt
-
-def valid_date(d: str) -> tuple[bool, str]:
-    """날짜 유효성 검사
-    Returns:
-        (bool, str): (유효성 여부, 오류 메시지)
-    """
-    try:
-        date = _dt.strptime(d, "%Y%m%d")
-        now = _dt.now()
-        
-        # 과거 날짜 체크
-        if date.date() < now.date():
-            return False, "과거 날짜는 선택할 수 없습니다"
-            
-        # 1년 이상 미래 체크
-        max_future = now.replace(year=now.year + 1)
-        if date > max_future:
-            return False, "1년 이상 미래의 날짜는 선택할 수 없습니다"
-            
-        return True, ""
-    except ValueError:
-        return False, "올바른 날짜 형식이 아닙니다 (YYYYMMDD)"
-
-# 공항 코드 유효성 검사
-def load_airports():
-    """공항 데이터 로드"""
-    airports_file = AIRPORTS_JSON_PATH
-    if not airports_file.exists():
-        logger.error(f"공항 데이터 파일이 없습니다: {airports_file.name}")
-        raise FileNotFoundError(f"{airports_file.name} 파일을 찾을 수 없습니다")
-        
-    try:
-        with open(airports_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"공항 데이터 로드 중 오류 발생: {e}")
-        raise
-
-# 공항 데이터 로드
-try:
-    AIRPORTS = load_airports()
-except Exception as e:
-    logger.error(f"공항 데이터 초기화 실패: {e}")
-    sys.exit(1)
-
-def get_airport_info(code: str) -> tuple[bool, str, str]:
-    """공항 코드의 유효성과 정보를 반환
-    Returns:
-        tuple[bool, str, str]: (유효성 여부, 도시명, 공항명)
-    """
-    code = code.upper()
-    for region_data in AIRPORTS.values():
-        airports = region_data.get('airports', {})
-        if code in airports:
-            city, airport = airports[code]
-            return True, city, airport
-    return False, "", ""
-
-def format_airport_list() -> str:
-    """자주 가는 공항 목록을 포매팅"""
-    lines = [
-        "✈️ *자주 찾는 공항 코드*",
-        "",
-        "*한국*",
-        "• `ICN`: 인천 (서울/인천국제공항)",
-        "• `GMP`: 김포 (서울/김포국제공항)",
-        "• `PUS`: 부산 (부산/김해국제공항)",
-        "• `CJU`: 제주 (제주국제공항)",
-        "",
-        "*일본*",
-        "• `NRT`: 나리타 (도쿄/나리타국제공항)",
-        "• `HND`: 하네다 (도쿄/하네다국제공항)",
-        "• `KIX`: 간사이 (오사카/간사이국제공항)",
-        "• `FUK`: 후쿠오카 (후쿠오카국제공항)",
-        "",
-        "*동남아시아*",
-        "• `BKK`: 방콕 (수완나품국제공항)",
-        "• `SGN`: 호치민 (떤선녓국제공항)",
-        "• `MNL`: 마닐라 (니노이 아키노국제공항)",
-        "• `SIN`: 싱가포르 (창이국제공항)",
-        "",
-        "💡 더 많은 공항 코드는 아래 링크에서 확인하실 수 있습니다:",
-        "[항공정보포털시스템](https://www.airportal.go.kr/airport/airport.do)"
-    ]
-    return "\n".join(lines)
-
-def valid_airport(code: str) -> tuple[bool, str]:
-    """공항 코드 유효성 검사 (기본 형식만 검사)
-    Returns:
-        (bool, str): (유효성 여부, 오류 메시지)
-    """
-    if not code.isalpha() or len(code) != 3:
-        return False, "공항 코드는 3자리 영문이어야 합니다"
-    
-    code = code.upper()
-    is_valid, city, airport = get_airport_info(code)
-    
-    # 알려진 공항이 아니더라도 형식이 맞으면 일단 허용
-    # 실제 유효성은 항공권 조회 시 확인됨
-    return True, ""
-
-# New cancel_conversation function
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the current conversation."""
     user_id = update.effective_user.id
@@ -545,7 +351,6 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return ConversationHandler.END
 
-# Modified monitor_setting function for better flow
 async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     final_keyboard = telegram_bot.get_keyboard_for_user(user_id)
@@ -573,7 +378,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 항공권 정보를 조회하는 중입니다...\n⏳ 잠시만 기다려주세요.",
         reply_markup=None
     )
-      # 메시지 매니저에 등록
+    # 메시지 매니저에 등록
     message_manager.set_status_message(user_id, status_message)
     
     try:
@@ -610,7 +415,7 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔍 {dep_city} → {arr_city} 항공권 조회 중...\n⏳ 네이버 항공권에서 정보를 가져오고 있습니다.",
             telegram_bot=telegram_bot
         )
-          # 가격 조회 (시간이 오래 걸리는 작업)
+        # 가격 조회 (시간이 오래 걸리는 작업)
         try:
             restricted, r_info, overall, o_info, link = await fetch_prices(
                 outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id, selenium_manager
@@ -925,7 +730,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"사용자 {user_id} 요청: /cancel")
-      # 모니터링 파일 찾기
+    # 모니터링 파일 찾기
     files = sorted([
     p for p in DATA_DIR.iterdir()
         if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id
@@ -1217,7 +1022,7 @@ async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg_parts = [f"✅ 전체 모니터링 종료: {count}건 처리됨"]
     if error_count > 0:
         msg_parts.append(f"⚠️ {error_count}건의 오류 발생")
-      # 인라인 키보드 제거
+
     await query.message.edit_text(
         "\n".join(msg_parts)
     )
@@ -1250,7 +1055,7 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
                 data = await load_json_data_async(hist_path)
             except json.JSONDecodeError:
                 logger.error(f"모니터링 복원 중 JSON 디코딩 오류 ({hist_path.name}). 파일 삭제 시도.")
-                try: hist_path.unlink(missing_ok=True) # missing_ok 추가 (Python 3.8+)
+                try: hist_path.unlink(missing_ok=True)
                 except OSError as e_unlink: logger.error(f"손상된 모니터링 파일 삭제 실패 ({hist_path.name}): {e_unlink}")
                 continue
             except FileNotFoundError:
@@ -1335,10 +1140,7 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
 
     logger.info(f"모니터링 복원 완료: 총 {processed_files}개 파일 처리, {active_jobs_restored}개 작업 활성/재개됨.")
 
-# Removed file_lock, save_json_data, load_json_data - using config_manager methods
-
-# Modified cleanup_old_data function signature and body
-async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context argument
+async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE):
     """오래된 모니터링 데이터와 설정 파일 정리"""
     retention_days = config_manager.DATA_RETENTION_DAYS
     config_retention_days = config_manager.CONFIG_RETENTION_DAYS
@@ -1351,7 +1153,6 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
     # 오래된 모니터링 데이터 정리
     for file_path in config_manager.DATA_DIR.glob("price_*.json"):
         try:
-            # Use load_json_data for consistent locking
             data = await load_json_data_async(file_path)
             start_time_str = data.get("start_time")
             if not start_time_str:
@@ -1377,7 +1178,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
         except json.JSONDecodeError:
             logger.warning(f"데이터 정리 중 JSON 디코딩 오류: {file_path.name}, 파일 삭제 시도.")
             try:
-                file_path.unlink() # Delete corrupted file
+                file_path.unlink()
                 monitor_deleted +=1
             except OSError as e:
                 logger.error(f"손상된 데이터 파일 삭제 실패 '{file_path.name}': {e}")
@@ -1387,8 +1188,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
     # 오래된 설정 파일 정리
     for config_file in config_manager.USER_CONFIG_DIR.glob("config_*.json"):
         try:
-            # Use async load for consistency and proper locking
-            if not config_file.exists(): continue # Might have been deleted
+            if not config_file.exists(): continue
 
             data = await load_json_data_async(config_file) # 비동기 로드 및 잠금
             last_activity_str = data.get('last_activity', data.get('created_at'))
@@ -1414,7 +1214,6 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
                     continue
                 user_id = int(user_id_match.group(1))
 
-                # Check for active monitors for this user
                 loop = asyncio.get_running_loop()
                 active_monitors = await loop.run_in_executor(
                     file_executor, 
@@ -1449,7 +1248,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE): # Add context ar
         )
         for admin_id in config_manager.ADMIN_IDS:
             try:
-                await context.bot.send_message( # Use context.bot
+                await context.bot.send_message(
                     chat_id=admin_id,
                     text=msg,
                     parse_mode="Markdown"
@@ -1472,7 +1271,7 @@ def cleanup_resources():
     """리소스 정리"""
     logger.info("리소스 정리 시작...")
     selenium_manager.shutdown()
-    file_executor.shutdown(wait=True)
+    cleanup_utils_resources()
     logger.info("리소스 정리 완료")
 
 def main():
