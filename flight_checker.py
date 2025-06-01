@@ -14,44 +14,38 @@
 - FILE_WORKERS      : (선택) 파일 I/O 작업용 최대 동시 작업자 수 (기본값: 5)
 - LOG_LEVEL         : (선택) 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL 중 선택, 기본값: INFO)
 """
-import os
 import re
 import json
 import time as time_module
 import logging
 import asyncio
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ConversationHandler,
-    ContextTypes, filters, JobQueue,
+    ContextTypes, filters,
     CallbackQueryHandler
 )
-from telegram import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from telegram.error import BadRequest, TimedOut, NetworkError
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import sys
-import threading
-from typing import Optional, Tuple, Dict, Any, Literal # Literal 추가
+from telegram import ReplyKeyboardRemove
+from typing import Optional, Tuple
 
-# ConfigManager import
 from config_manager import config_manager, NotificationPreferenceType
 
-# TelegramBot import
 from telegram_bot import TelegramBot, MessageManager, SETTING
 
-# ConfigManager에서 설정값들을 가져옴
+from selenium_manager import (
+    SeleniumManager, NoFlightDataException, NoMatchingFlightsException,
+    parse_flight_info, check_time_restrictions, fetch_prices
+)
+
+# ConfigManager에서 설정값들 가져오기
 TIME_PERIODS = config_manager.TIME_PERIODS
 DEFAULT_USER_CONFIG = config_manager.DEFAULT_USER_CONFIG
 DEFAULT_NOTIFICATION_PREFERENCE = config_manager.DEFAULT_NOTIFICATION_PREFERENCE
@@ -70,164 +64,16 @@ CONFIG_RETENTION_DAYS = config_manager.CONFIG_RETENTION_DAYS
 FILE_WORKERS = config_manager.FILE_WORKERS
 KST = ZoneInfo("Asia/Seoul")
 
-# 전역 텔레그램 봇 인스턴스
+# 전역 인스턴스들
 telegram_bot = TelegramBot()
 message_manager = telegram_bot.message_manager
 
-# Selenium 작업 관리를 위한 전용 매니저 클래스
-class SeleniumManager:
-    def __init__(self, max_workers: int = 3, grid_url: str = None, user_agent: str = None):
-        """
-        Selenium 작업을 위한 전용 매니저
-        
-        Args:
-            max_workers: 동시 실행할 최대 브라우저 수 (환경 변수 SELENIUM_WORKERS로 설정 가능)
-            grid_url: Selenium Grid URL (환경 변수 SELENIUM_HUB_URL로 설정 가능)
-            user_agent: 브라우저 User-Agent (환경 변수 USER_AGENT로 설정 가능)
-        """
-        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="selenium")
-        self.grid_url = grid_url
-        self.user_agent = user_agent
-        self.active_tasks = 0
-        self.lock = threading.Lock()
-    
-    def setup_driver(self) -> webdriver.Remote:
-        """브라우저 드라이버 설정"""
-        logger.info(f"[SeleniumManager] setup_driver 진입 (grid_url={self.grid_url}, user_agent={self.user_agent})")
-        options = webdriver.ChromeOptions()
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        if self.user_agent:
-            options.add_argument(f'user-agent={self.user_agent}')
-        try:
-            if self.grid_url:
-                logger.info(f"[SeleniumManager] Remote WebDriver 생성 시도: {self.grid_url}")
-                driver = webdriver.Remote(
-                    command_executor=self.grid_url,
-                    options=options
-                )
-            else:
-                logger.info("[SeleniumManager] Local ChromeDriver 생성 시도")
-                driver = webdriver.Chrome(options=options)
-            logger.info("[SeleniumManager] WebDriver 생성 완료")
-            return driver
-        except Exception as e:
-            logger.error(f"[SeleniumManager] WebDriver 생성 실패: {e}", exc_info=True)
-            raise
-
-    def _fetch_single(self, url: str, depart: str, arrive: str, config: dict) -> Tuple[Any, str, Any, str, str]:
-        """단일 조회 실행 (동기 함수)"""
-        with self.lock:
-            self.active_tasks += 1
-            task_id = self.active_tasks
-        
-        logger.info(f"Selenium 작업 시작 #{task_id}: {depart}->{arrive}")
-        driver = None
-        
-        try:
-            driver = self.setup_driver()
-            overall_price, restricted_price = None, None
-            overall_info, restricted_info = "", ""
-            
-            logger.info(f"[SeleniumManager] driver.get 호출 준비: {url}")
-            driver.get(url)
-            logger.info(f"[SeleniumManager] driver.get 완료: {url}")
-            WebDriverWait(driver, 40).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="inlineFilter_FilterWrapper__"]'))
-            )
-            time_module.sleep(5)
-            items = driver.find_elements(By.XPATH, '//*[@id="international-content"]/div/div[3]/div')
-            
-            if not items:
-                logger.warning(f"NO_ITEMS for {url}")
-                raise NoFlightDataException("항공권 정보를 찾을 수 없습니다 (NO_ITEMS)")
-
-            found_any_price = False
-            for item in items:
-                text = item.text
-                logger.debug(f"항공권 정보 텍스트: {text}")
-                
-                if "경유" in text:
-                    logger.debug("경유 항공편 제외")
-                    continue
-                    
-                flight_info = parse_flight_info(text, depart, arrive)
-                if not flight_info:
-                    continue
-                    
-                dep_departure, dep_arrival, ret_departure, ret_arrival, price = flight_info
-                found_any_price = True
-                
-                if overall_price is None or price < overall_price:
-                    overall_price = price
-                    overall_info = (
-                        f"가는 편: {dep_departure} → {dep_arrival}\n"
-                        f"오는 편: {ret_departure} → {ret_arrival}\n"
-                        f"왕복 가격: {price:,}원"
-                    )
-                    logger.debug(f"전체 최저가 갱신: {price:,}원")
-                
-                if check_time_restrictions(dep_departure, ret_departure, config):
-                    if restricted_price is None or price < restricted_price:
-                        restricted_price = price
-                        restricted_info = (
-                            f"가는 편: {dep_departure} → {dep_arrival}\n"
-                            f"오는 편: {ret_departure} → {ret_arrival}\n"
-                            f"왕복 가격: {price:,}원"
-                        )
-                        logger.info(f"조건부 최저가 갱신: {price:,}원")
-
-            if not found_any_price:
-                logger.warning(f"NO_PRICES (found_any_price=False) for {url}")
-                raise NoMatchingFlightsException("조건에 맞는 항공권을 찾을 수 없습니다 (NO_PRICES_PARSED)")
-            
-            logger.info(f"Selenium 작업 완료 #{task_id}")
-            return restricted_price, restricted_info, overall_price, overall_info, url
-            
-        except Exception as e:
-            logger.error(f"Selenium 작업 #{task_id} 실패: {e}", exc_info=True)
-            raise
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                    logger.info(f"[SeleniumManager] WebDriver quit 완료 (task_id={task_id})")
-                except Exception as quit_e:
-                    logger.error(f"[SeleniumManager] WebDriver quit 중 오류: {quit_e}", exc_info=True)
-            with self.lock:
-                self.active_tasks -= 1
-
-    async def fetch_prices_async(self, url: str, depart: str, arrive: str, config: dict) -> Tuple[Any, str, Any, str, str]:
-        """비동기 가격 조회"""
-        loop = asyncio.get_running_loop()
-        
-        try:
-            result = await loop.run_in_executor(
-                self.executor,
-                self._fetch_single,
-                url, depart, arrive, config
-            )
-            return result
-        except Exception as e:
-            logger.error(f"비동기 fetch_prices 실패: {e}")
-            raise
-    
-    def shutdown(self):
-        """리소스 정리"""
-        logger.info("SeleniumManager 종료 중...")
-        self.executor.shutdown(wait=True)
-
-# 전역 Selenium 매니저 인스턴스 생성
 selenium_manager = SeleniumManager(
     max_workers=config_manager.MAX_WORKERS,
     grid_url=config_manager.SELENIUM_HUB_URL,
     user_agent=config_manager.USER_AGENT
 )
 
-# 파일 작업용 executor
 file_executor = ThreadPoolExecutor(max_workers=FILE_WORKERS, thread_name_prefix="file")
 
 async def load_json_data_async(file_path: Path) -> dict:
@@ -469,18 +315,8 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❗ 설정 변경에 실패했습니다. 올바른 명령어인지 확인해주세요."
         )
 
-# Removed rotate_logs function - using config_manager.setup_logging method
-
-# logging.basicConfig(...) # 여기서 로깅 설정 제거
-# rotate_logs() # 여기서 호출 제거
-
-# 로거 인스턴스는 모듈 레벨에서 생성 유지
+# 로거 인스턴스 생성
 logger = logging.getLogger(__name__)
-
-# 기존 환경변수 상수들을 config_manager로 교체
-# BOT_TOKEN, SELENIUM_HUB_URL, USER_AGENT, MAX_MONITORS, ADMIN_IDS 등은 
-# config_manager에서 관리되므로 직접 정의하지 않음
-
 KST = ZoneInfo("Asia/Seoul")
 SETTING = 1
 
@@ -488,140 +324,6 @@ SETTING = 1
 PATTERN = re.compile(
     r"price_(?P<uid>\d+)_(?P<dep>[A-Z]{3})_(?P<arr>[A-Z]{3})_(?P<dd>\d{8})_(?P<rd>\d{8})\.json"
 )
-
-# Removed format_datetime - using config_manager.format_datetime method
-
-def parse_flight_info(text: str, depart: str, arrive: str) -> tuple[str, str, str, str, int] | None:
-    """항공편 정보 파싱
-    Returns:
-        tuple[str, str, str, str, int] | None: (출발시각, 도착시각, 귀국출발시각, 귀국도착시각, 가격)
-    """
-    # 가는 편: 출발지에서 도착지로 가는 항공편
-    m_dep = re.search(rf'(\d{{2}}:\d{{2}}){depart}\s+(\d{{2}}:\d{{2}}){arrive}', text, re.IGNORECASE)
-    if not m_dep:
-        return None
-        
-    # 오는 편: 도착지에서 출발지로 오는 항공편
-    m_ret = re.search(rf'(\d{{2}}:\d{{2}}){arrive}\s+(\d{{2}}:\d{{2}}){depart}', text, re.IGNORECASE)
-    if not m_ret:
-        return None
-        
-    # 가격 정보
-    m_price = re.search(r'왕복\s*([\d,]+)원', text)
-    if not m_price:
-        return None
-        
-    price = int(m_price.group(1).replace(",", ""))
-    return (
-        m_dep.group(1),  # 출발시각
-        m_dep.group(2),  # 도착시각
-        m_ret.group(1),  # 귀국출발시각
-        m_ret.group(2),  # 귀국도착시각
-        price           # 가격
-    )
-
-def check_time_restrictions(dep_time: str, ret_time: str, config: dict) -> bool:
-    """시간 제한 조건 체크
-    Returns:
-        bool: 시간 제한 조건 만족 여부
-    """
-    dep_t = datetime.strptime(dep_time, "%H:%M").time()
-    ret_t = datetime.strptime(ret_time, "%H:%M").time()
-    
-    if config['time_type'] == 'time_period':
-        # 시간대 설정: 선택된 시간대 중 하나라도 포함되면 유효
-        outbound_periods = config['outbound_periods']
-        inbound_periods = config['inbound_periods']
-        
-        # 가는 편: 선택된 시간대 중 하나라도 포함되면 유효
-        is_valid_outbound = any(
-            period_start <= dep_t.hour < period_end
-            for period in outbound_periods
-            for period_start, period_end in [TIME_PERIODS[period]]
-        )
-        if not is_valid_outbound:
-            logger.debug(f"가는 편 시간대 미매칭: {dep_t}는 선택된 시간대 {outbound_periods}에 포함되지 않음")
-            return False
-            
-        # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
-        is_valid_inbound = any(
-            period_start <= ret_t.hour < period_end
-            for period in inbound_periods
-            for period_start, period_end in [TIME_PERIODS[period]]
-        )
-        if not is_valid_inbound:
-            logger.debug(f"오는 편 시간대 미매칭: {ret_t}는 선택된 시간대 {inbound_periods}에 포함되지 않음")
-            return False
-            
-    else:  # exact
-        # 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후
-        outbound_limit = time(hour=config['outbound_exact_hour'], minute=0)
-        if dep_t > outbound_limit:
-            logger.debug(f"가는 편 시각 미매칭: {dep_t} > {outbound_limit}")
-            return False
-            
-        inbound_limit = time(hour=config['inbound_exact_hour'], minute=0)
-        if ret_t < inbound_limit:
-            logger.debug(f"오는 편 시각 미매칭: {ret_t} < {inbound_limit}")
-            return False
-            
-    return True
-
-# Custom Exceptions (defined globally)
-class NoFlightDataException(Exception):
-    """항공권 정보를 크롤링할 수 없을 때 발생"""
-    pass
-
-class NoMatchingFlightsException(Exception):
-    """조건에 맞는 항공권을 찾을 수 없을 때 발생"""
-    pass
-
-# Modified fetch_prices to raise custom exceptions
-async def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_retries=3, user_id=None):
-    """항공권 가격 조회 (비동기 처리)"""
-    logger.info(f"fetch_prices 호출: {depart}->{arrive} {d_date}~{r_date} (User: {user_id})")
-    url = (
-        f"https://flight.naver.com/flights/international/"
-        f"{depart}-{arrive}-{d_date}/{arrive}-{depart}-{r_date}?adult=1&fareType=Y"
-    )
-    config = await get_user_config_async(user_id) if user_id else DEFAULT_USER_CONFIG.copy()
-    
-    async def _fetch_with_retry():
-        last_exception = None
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"시도 {attempt + 1}/{max_retries}: {depart}->{arrive}")
-                
-                # 전역 selenium_manager 사용
-                result = await selenium_manager.fetch_prices_async(url, depart, arrive, config)
-                
-                logger.info(f"조회 성공: {depart}->{arrive} (시도 {attempt + 1})")
-                return result
-                
-            except (NoFlightDataException, NoMatchingFlightsException) as e:
-                last_exception = e
-                logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패 (Specific): {e}")
-                if attempt == max_retries - 1:
-                    raise
-            except Exception as ex:
-                last_exception = ex
-                logger.warning(f"fetch_prices 시도 {attempt + 1}/{max_retries} 실패 (Generic): {ex}", exc_info=True)
-                if attempt == max_retries - 1:
-                    raise Exception(f"항공권 조회 중 오류가 발생했습니다: {ex}") from ex
-                
-                wait_time = 5 * (attempt + 1)
-                logger.info(f"{wait_time}초 대기 후 재시도...")
-                await asyncio.sleep(wait_time)
-        
-        if last_exception:
-            raise last_exception
-        raise Exception("항공권 조회 중 알 수 없는 오류로 모든 시도 실패")
-
-    return await _fetch_with_retry()
-
-# 도움말 텍스트는 telegram_bot 모듈로 이동됨
-
-# 키보드 관련 함수들은 telegram_bot 모듈로 이동됨
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 {update.effective_user.id} 요청: /start")
@@ -657,8 +359,6 @@ def validate_url(url: str) -> tuple[bool, str]:
         return True, ""
     except Exception:
         return False, "URL 파싱 중 오류가 발생했습니다"
-
-# Removed validate_env_vars - using config_manager.validate_env_vars method
 
 # 명령어 속도 제한
 class RateLimiter:
@@ -910,11 +610,10 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔍 {dep_city} → {arr_city} 항공권 조회 중...\n⏳ 네이버 항공권에서 정보를 가져오고 있습니다.",
             telegram_bot=telegram_bot
         )
-        
-        # 가격 조회 (시간이 오래 걸리는 작업)
+          # 가격 조회 (시간이 오래 걸리는 작업)
         try:
             restricted, r_info, overall, o_info, link = await fetch_prices(
-                outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
+                outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id, selenium_manager
             )
             
             if restricted is None and overall is None:
@@ -1064,7 +763,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         restricted, r_info, overall, o_info, link = await fetch_prices(
-            outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id
+            outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id, selenium_manager
         )
         
         notify_msg_lines = []
@@ -1542,7 +1241,6 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
     for hist_path in DATA_DIR.glob("price_*.json"):
         processed_files += 1
         try:
-            # logger.debug(f"모니터링 파일 처리 중: {hist_path.name}") # 상세 로그는 필요시 활성화
             m = PATTERN.fullmatch(hist_path.name)
             if not m:
                 logger.warning(f"잘못된 모니터링 파일 이름 패턴 무시: {hist_path.name}")
@@ -1593,9 +1291,7 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
                         "settings": (dep, arr, dd, rd),
                         "hist_path": str(hist_path)
                     }
-                )
-
-            # 정기 반복 작업 (Repeating job)
+                )            # 정기 반복 작업 (Repeating job)
             if delta.total_seconds() < 0: # last_fetch가 미래 시간인 경우 (시스템 시간 변경 등)
                 next_run_delay = interval
                 logger.warning(
@@ -1607,12 +1303,6 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
                 next_run_delay = interval - time_into_current_cycle
                 if next_run_delay.total_seconds() == 0 and delta.total_seconds() > 0:
                      next_run_delay = interval
-
-            # logger.info(
-            #     f"정기 모니터링 등록: {hist_path.name} | "
-            #     f"Last Fetch: {last_fetch_str if last_fetch_str else 'N/A'} | Now: {config_manager.format_datetime(now)} | Delta: {delta.total_seconds()/60:.1f}분 | "
-            #     f"다음 실행까지 약: {next_run_delay.total_seconds()/60:.1f}분"
-            # ) # 상세 로그는 유지하거나 필요시 주석 해제
 
             job = app.job_queue.run_repeating(
                 monitor_job,
@@ -1633,7 +1323,6 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
                     parsed_start_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
                 except ValueError:
                     logger.warning(f"잘못된 start_time 형식 ({hist_path.name}): '{start_time_str}'")
-            
             monitors.setdefault(uid, []).append({
                 "settings": (dep, arr, dd, rd),
                 "start_time": parsed_start_time,
@@ -1643,12 +1332,6 @@ async def on_startup(app: ApplicationBuilder): # Type hint for app
 
         except Exception as ex_outer:
             logger.error(f"모니터링 복원 중 ({hist_path.name}) 처리 실패: {ex_outer}", exc_info=True)
-            # 오류 발생한 모니터링 파일 삭제 시도 (선택적)
-            # try:
-            #     hist_path.unlink(missing_ok=True)
-            #     logger.info(f"오류 발생으로 모니터링 파일 삭제 시도: {hist_path.name}")
-            # except OSError as e_unlink_outer:
-            #     logger.error(f"오류 모니터링 파일 삭제 실패 ({hist_path.name}): {e_unlink_outer}")
 
     logger.info(f"모니터링 복원 완료: 총 {processed_files}개 파일 처리, {active_jobs_restored}개 작업 활성/재개됨.")
 
@@ -1808,14 +1491,11 @@ def main():
         return # main 함수 종료
     
     if not config_manager.BOT_TOKEN:
-        # 이 경우는 validate_env_vars에서 이미 처리되지만, 추가 방어 코드
+    # 이 경우는 validate_env_vars에서 이미 처리되지만, 추가 방어 코드
         logger.error("환경변수 BOT_TOKEN이 설정되어 있지 않습니다. 봇을 시작할 수 없습니다.")
         return # main 함수 종료
     
     application = ApplicationBuilder().token(config_manager.BOT_TOKEN).concurrent_updates(True).build()
-    
-    # 작업 디렉토리 생성 (DATA_DIR은 이미 상단에서 생성 시도됨, USER_CONFIG_DIR 등)
-    # DATA_DIR.mkdir(parents=True, exist_ok=True) # 중복될 수 있으므로 확인
     
     # 핸들러 등록
     conv_handler = ConversationHandler(

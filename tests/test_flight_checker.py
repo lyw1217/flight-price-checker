@@ -45,6 +45,7 @@ class TestFlightChecker(unittest.TestCase):
     user_configs_path_class = None
     logs_path_class = None
 
+    
     @classmethod
     def setUpClass(cls):
         cls.test_data_root = _test_data_root_for_env
@@ -72,8 +73,7 @@ class TestFlightChecker(unittest.TestCase):
         
         # 로거 패치 시작 (모듈 로드 이후)
         cls.logger_patcher = patch.object(cls.flight_checker_module, 'logger', MagicMock())
-        cls.logger_patcher.start()
-          # 필요한 심볼들을 클래스 변수에 할당
+        cls.logger_patcher.start()        # 필요한 심볼들을 클래스 변수에 할당
         cls.MessageManager = cls.flight_checker_module.message_manager.__class__  # telegram_bot 모듈의 MessageManager
         cls.validate_url = cls.flight_checker_module.validate_url
         cls.parse_flight_info = cls.flight_checker_module.parse_flight_info
