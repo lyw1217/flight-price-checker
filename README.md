@@ -1,35 +1,43 @@
 # 항공권 최저가 조회 봇
 
-텔레그램 봇을 통해 항공권 최저가를 주기적으로 조회하고 가격 하락 시 알림을 보내주는 서비스입니다.
+텔레그램 봇을 통해 항공권 최저가를 주기적으로 조회하고 가격 하락 등 다양한 조건에 따라 알림을 보내주는 서비스입니다.
 
 ## 주요 기능
 
-- 30분마다 항공권 가격 자동 조회
-- 가격 하락 시 텔레그램으로 알림
-- 시간대 또는 시각 기반의 항공편 필터링
-- 사용자별 다중 모니터링 지원
-- 관리자 기능 (전체 현황 조회, 일괄 취소)
+- 30분마다 항공권 가격 자동 조회 및 모니터링
+- 가격 하락, 목표가 도달, 변동 등 다양한 조건에 따른 텔레그램 알림
+- 시간대(예: 오전1, 오후2 등) 또는 시각(예: 9시 이전/15시 이후) 기반 항공편 필터링
+- 사용자별 다중 모니터링 지원 (기본 3개, 환경변수로 조정 가능)
+- 알림 주기(분 단위) 및 조건 사용자별 설정
+- 관리자 기능: 전체 현황 조회, 전체 모니터링 일괄 취소
+- 공항 코드 자동 로드 및 검증
+- 데이터/설정/로그 자동 보관 및 정리
 
 ## 설치 방법
 
 1. Python 3.8 이상 설치
 2. 필요한 패키지 설치:
-```bash
-pip install -r requirements.txt
-```
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 ## 환경 변수 설정
 
 필수 환경변수:
 - `BOT_TOKEN`: Telegram 봇 토큰
-- `SELENIUM_HUB_URL`: Selenium Hub 주소 (기본: http://localhost:4444/wd/hub)
-- `ADMIN_IDS`: 관리자 ID 목록 (쉼표 구분)
+- `SELENIUM_HUB_URL`: Selenium Grid 주소 (예: http://localhost:4444/wd/hub)
+- `ADMIN_IDS`: 관리자 ID 목록 (쉼표로 구분, 예: 12345678,98765432)
 
 선택 환경변수:
-- `USER_AGENT`: Selenium 헤드리스 브라우저용 User-Agent
+- `USER_AGENT`: Selenium 브라우저 User-Agent (기본값 제공)
 - `MAX_MONITORS`: 사용자당 최대 모니터링 개수 (기본: 3)
+- `MAX_WORKERS`: Selenium 동시 실행 브라우저 수 (기본: 5)
+- `FILE_WORKERS`: 파일 I/O 동시 작업자 수 (기본: 5)
 - `DATA_RETENTION_DAYS`: 모니터링 데이터 보관 기간 (일, 기본: 30)
 - `CONFIG_RETENTION_DAYS`: 사용자 설정 파일 보관 기간 (일, 기본: 7)
+- `LOG_LEVEL`: 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL, 기본: INFO)
+
+`.env.example` 파일 참고
 
 ## 실행 방법
 
@@ -39,108 +47,73 @@ python flight_checker.py
 
 ## 봇 명령어
 
-기본 명령어:
-- `/monitor` - 새로운 모니터링 시작
-- `/status` - 모니터링 현황 확인
-- `/cancel` - 모니터링 취소
-- `/settings` - 시간 제한 설정
-- `/airport` - 공항 코드 목록
-- `/help` - 도움말
+**기본 명령어:**
+- `/monitor`   : 새로운 모니터링 시작
+- `/status`    : 내 모니터링 현황 확인
+- `/cancel`    : 모니터링 취소
+- `/settings`  : 시간/알림 조건 등 설정 확인 및 안내
+- `/set`       : 시간/알림 조건/주기 직접 변경 (예: `/set 가는편 시간대 오전1 오전2`)
+- `/airport`   : 주요 공항 코드 목록 안내
+- `/help`      : 도움말
 
-관리자 명령어:
-- `/allstatus` - 전체 모니터링 현황
-- `/allcancel` - 전체 모니터링 취소
+**관리자 명령어:**
+- `/allstatus` : 전체 사용자 모니터링 현황
+- `/allcancel` : 전체 모니터링 일괄 취소
+
+## 주요 설정 예시
+
+- 시간대 설정: `/set 가는편 시간대 오전1 오전2`  (가는 편 오전1, 오전2 시간대만 검색)
+- 시각 설정: `/set 오는편 시각 15`  (오는 편 15시 이후 출발만 검색)
+- 알림 조건:
+  - `/set 알림조건 기본` (5000원 이상 하락 시)
+  - `/set 알림조건 하락시` (1원이라도 하락 시)
+  - `/set 알림조건 변동시` (상승/하락 모두 알림)
+  - `/set 알림조건 목표가 150000` (15만원 이하 도달 시)
+  - `/set 알림조건 역대최저가` (모니터링 시작 후 최저가 갱신 시)
+  - `/set 알림조건 하락기준 3000` (3000원 이상 하락 시)
+- 알림 주기: `/set 알림주기 15` (15분마다 알림)
+
+## 데이터 저장 및 관리
+
+- 모니터링 데이터: `/data/price_*.json` (각 모니터링별 개별 파일, 자동 생성/정리)
+- 사용자 설정: `/data/user_configs/config_*.json` (각 사용자별 설정, 자동 생성/정리)
+- 로그 파일: `/data/logs/flight_bot.log` (실행/오류/상태 로그, 자동 생성/정리)
+- 공항 데이터: `data/airports.json` (공항 정보, 필요시 직접 편집)
+
+> `/data` 폴더 하위에 모든 데이터가 저장되며, 공항 데이터(`airports.json`)만 `data/airports.json`(루트 기준)에 위치합니다.
+> 모든 폴더/파일은 프로그램 실행 시 자동 생성되며,
+> 오래된 데이터/설정/로그는 환경변수(`DATA_RETENTION_DAYS`, `CONFIG_RETENTION_DAYS`)에 따라 자동 삭제됩니다.
+
+### 공항 데이터 관리
+
+공항 정보는 `data/airports.json` 파일에서 관리합니다. 필요시 직접 편집하여 공항 정보를 추가/수정할 수 있습니다.
 
 ## 테스트
 
-프로젝트는 다음과 같은 구조로 테스트 코드가 구성되어 있습니다:
-
-```
-flight-price-checker/
-├── flight_checker.py      # 메인 코드
-└── tests/                 # 테스트 코드 디렉토리
-    ├── __init__.py       # 테스트 패키지 초기화 파일
-    └── test_flight_checker.py  # 테스트 코드
-```
+테스트는 unittest 기반으로 작성되어 있습니다.
 
 ### 테스트 실행 방법
 
-1. 전체 테스트 실행:
 ```bash
 python -m unittest discover tests
 ```
 
-2. 특정 테스트 파일 실행:
-```bash
-python -m unittest tests/test_flight_checker.py
-```
-
-3. 특정 테스트 클래스나 메소드 실행:
-```bash
-python -m unittest tests.test_flight_checker.TestFlightChecker
-python -m unittest tests.test_flight_checker.TestFlightChecker.test_valid_date
-```
-
 ### 테스트 범위
-
-현재 구현된 테스트:
 - URL 유효성 검증
 - 항공편 정보 파싱
 - 시간 제한 조건 체크
 - 날짜 유효성 검사
 - 공항 코드 유효성 검사
-- 사용자 설정(config) 로드 및 저장 기능
-- 시간 설정 문자열 포맷팅 기능
-- 시간 범위 반환 기능
-- 메시지 매니저 (MessageManager) 기능
-
-## 데이터 저장
-
-- 모니터링 데이터: `/data/price_*.json`
-- 사용자 설정: `/data/user_configs/config_*.json`
-- 로그 파일: `/data/logs/flight_bot.log`
-- 공항 데이터: `/data/airports.json`
-
-### 공항 데이터 관리
-
-공항 정보는 `/data/airports.json` 파일에서 관리됩니다. 파일 형식은 다음과 같습니다:
-
-```json
-{
-    "지역코드": {
-        "name": "지역명",
-        "airports": {
-            "공항코드": ["도시명", "공항명"],
-            ...
-        }
-    }
-}
-```
-
-예시:
-```json
-{
-    "KOR": {
-        "name": "한국",
-        "airports": {
-            "ICN": ["인천", "서울/인천국제공항"],
-            "GMP": ["김포", "서울/김포국제공항"]
-        }
-    }
-}
-```
-
-공항 정보를 수정하거나 추가하려면 이 파일을 직접 편집하면 됩니다. 프로그램은 시작할 때 이 파일을 자동으로 로드합니다.
+- 사용자 설정(config) 로드 및 저장
+- 시간 설정 문자열 포맷팅/시간 범위 반환
+- 메시지 매니저(MessageManager) 기능 등
 
 ## 주의사항
 
-1. 데이터 보관 기간
-   - 모니터링 데이터: `DATA_RETENTION_DAYS`일 후 자동 삭제
-   - 사용자 설정: 마지막 활동으로부터 `CONFIG_RETENTION_DAYS`일 후 자동 삭제
-
-2. 시간 제한 설정
-   - 시간대 설정: 새벽(00-06), 오전1(06-09), 오전2(09-12), 오후1(12-15), 오후2(15-18), 밤1(18-21), 밤2(21-24)
-   - 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후 항공편 검색
+- Selenium Grid가 반드시 실행 중이어야 하며, SELENIUM_HUB_URL이 올바르게 설정되어야 합니다.
+- 데이터/설정 파일은 자동으로 주기적 정리됩니다.
+- 시간대 구분: 새벽(00-06), 오전1(06-09), 오전2(09-12), 오후1(12-15), 오후2(15-18), 밤1(18-21), 밤2(21-24)
+- 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후 항공편 검색
 
 ## 라이선스
 
