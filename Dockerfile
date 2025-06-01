@@ -27,10 +27,11 @@ ENV SELENIUM_HUB_URL=http://localhost:4444/wd/hub \
     FILE_WORKERS=5 \
     DATA_RETENTION_DAYS=30 \
     CONFIG_RETENTION_DAYS=7 \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    BOT_TOKEN="" \
+    ADMIN_IDS=""
 
-# 필수 환경변수 (런타임에 설정해야 함)
-# BOT_TOKEN - 텔레그램 봇 토큰 (보안상 여기서 기본값 설정하지 않음)
-# ADMIN_IDS - 관리자 ID 목록 (쉼표로 구분, 선택사항)
+# 주의: BOT_TOKEN은 필수 환경변수입니다. 컨테이너 실행 시 반드시 설정해주세요.
+# 예: docker run -e BOT_TOKEN=your_actual_token ...
 
 CMD ["python", "flight_checker.py"]
