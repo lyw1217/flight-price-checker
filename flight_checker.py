@@ -1770,7 +1770,7 @@ async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-async def cleanup_resources():
+def cleanup_resources():
     """리소스 정리"""
     logger.info("리소스 정리 시작...")
     selenium_manager.shutdown()
@@ -1832,23 +1832,32 @@ def main():
         application.add_handler(CommandHandler("allcancel", all_cancel))
     
     # 매일 자정에 오래된 데이터 정리
-    application.job_queue.run_daily(
-        cleanup_old_data,
+    application.job_queue.run_daily(        cleanup_old_data,
         time=time(hour=0, minute=0, tzinfo=KST)
     )
     
     logger.info("봇 실행 시작")
-    # 시작 시 on_startup 함수 직접 실행
-    asyncio.get_event_loop().run_until_complete(on_startup(application))
+    # 시작 시 on_startup 함수 실행 (비동기)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(on_startup(application))
     
     try:
         # 봇 실행
         application.run_polling()
+    except KeyboardInterrupt:
+        logger.info("키보드 인터럽트로 봇 종료")
+    except Exception as e:
+        logger.error(f"봇 실행 중 오류 발생: {e}", exc_info=True)
     finally:
         # 종료 시 리소스 정리
-        if not asyncio.get_event_loop().is_closed():
-            asyncio.get_event_loop().run_until_complete(cleanup_resources())
-        asyncio.get_event_loop().close()
+        logger.info("봇 종료 중...")
+        cleanup_resources()
+        try:
+            loop.close()
+        except Exception as e:
+            logger.warning(f"이벤트 루프 종료 중 오류: {e}")
+        logger.info("봇 종료 완료")
 
 if __name__ == "__main__":
     main()
