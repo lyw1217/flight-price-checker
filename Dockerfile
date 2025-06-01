@@ -20,7 +20,17 @@ COPY . .
 RUN mkdir -p /data
 
 # 환경변수 기본값 설정
-ENV DATA_RETENTION_DAYS=30 \
-    MAX_MONITORS=3
+ENV SELENIUM_HUB_URL=http://localhost:4444/wd/hub \
+    USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36" \
+    MAX_MONITORS=5 \
+    MAX_WORKERS=5 \
+    FILE_WORKERS=5 \
+    DATA_RETENTION_DAYS=30 \
+    CONFIG_RETENTION_DAYS=7 \
+    LOG_LEVEL=INFO
+
+# 필수 환경변수 (런타임에 설정해야 함)
+# BOT_TOKEN - 텔레그램 봇 토큰 (보안상 여기서 기본값 설정하지 않음)
+# ADMIN_IDS - 관리자 ID 목록 (쉼표로 구분, 선택사항)
 
 CMD ["python", "flight_checker.py"]

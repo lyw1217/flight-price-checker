@@ -116,9 +116,8 @@ class ConfigManager:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
         )
-        
-        # 제한 설정
-        self.MAX_MONITORS = int(os.getenv("MAX_MONITORS", "3"))
+          # 제한 설정
+        self.MAX_MONITORS = int(os.getenv("MAX_MONITORS", "5"))
         self.MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
         self.FILE_WORKERS = int(os.getenv("FILE_WORKERS", "5"))
         
@@ -162,10 +161,9 @@ class ConfigManager:
             for admin_id in raw_admin.split(","):
                 if admin_id.strip() and not admin_id.strip().isdigit():
                     errors.append(f"ADMIN_IDS에 올바르지 않은 ID가 포함되어 있습니다: {admin_id}")
-        
-        # 숫자형 환경변수 검증
+          # 숫자형 환경변수 검증
         for var_name, default, min_val in [
-            ("MAX_MONITORS", "3", 1),
+            ("MAX_MONITORS", "5", 1),
             ("DATA_RETENTION_DAYS", "30", 1),
             ("CONFIG_RETENTION_DAYS", "7", 1),
             ("MAX_WORKERS", "5", 1),
