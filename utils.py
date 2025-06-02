@@ -70,10 +70,6 @@ def format_notification_setting(config: dict) -> str:
     """알림 설정을 문자열로 변환합니다."""
     return config_manager.format_notification_setting(config)
 
-def format_notification_price_type(config: dict) -> str:
-    """알림 가격 타입을 문자열로 변환합니다."""
-    return config_manager.format_notification_price_type(config)
-
 
 # ===== 검증 함수들 =====
 

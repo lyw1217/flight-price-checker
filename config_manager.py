@@ -58,6 +58,7 @@ class ConfigManager:
             "밤1": (18, 21),   # 18:00 ~ 21:00
             "밤2": (21, 24),   # 21:00 ~ 00:00
         }
+        
         # 기본 사용자 설정
         self.DEFAULT_USER_CONFIG = {
             "time_type": "time_period",        # 'time_period' 또는 'exact'
@@ -69,13 +70,12 @@ class ConfigManager:
             "notification_threshold_amount": 5000,
             "notification_target_price": None,
             "notification_interval": 30,  # 분 단위
-            "notification_price_type": "RESTRICTED_ONLY",  # 알림 대상: RESTRICTED_ONLY, OVERALL_ONLY, BOTH
         }
+        
         # 알림 조건 기본값
         self.DEFAULT_NOTIFICATION_PREFERENCE: NotificationPreferenceType = "PRICE_DROP_THRESHOLD"
         self.DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT = 5000
         self.DEFAULT_NOTIFICATION_TARGET_PRICE = None
-        self.DEFAULT_NOTIFICATION_PRICE_TYPE = "RESTRICTED_ONLY"
         
         # 로그 파일 크기 제한 (10MB)
         self.MAX_LOG_SIZE = 10 * 1024 * 1024
@@ -342,6 +342,7 @@ class ConfigManager:
             hour = config[f'{direction}_exact_hour']
             direction_str = "이전 출발" if direction == 'outbound' else "이후 출발"
             return f"{hour:02d}:00 {direction_str}"
+    
     def format_notification_setting(self, config: dict) -> str:
         """알림 설정을 문자열로 변환합니다."""
         preference = config.get("notification_preference", self.DEFAULT_NOTIFICATION_PREFERENCE)
@@ -363,19 +364,6 @@ class ConfigManager:
             return "역대최저가 갱신 시"
         else:
             return f"알 수 없음 ({preference})"
-    
-    def format_notification_price_type(self, config: dict) -> str:
-        """알림 가격 타입을 문자열로 변환합니다."""
-        price_type = config.get("notification_price_type", self.DEFAULT_NOTIFICATION_PRICE_TYPE)
-        
-        if price_type == "RESTRICTED_ONLY":
-            return "시간 제한 적용 최저가만"
-        elif price_type == "OVERALL_ONLY":
-            return "전체 최저가만"
-        elif price_type == "BOTH":
-            return "시간 제한 적용 + 전체 최저가"
-        else:
-            return f"알 수 없음 ({price_type})"
     
     def get_time_range(self, config: dict, direction: str) -> tuple:
         """시간 범위를 반환합니다.

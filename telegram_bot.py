@@ -105,19 +105,19 @@ class TelegramBot:
     def get_base_keyboard(self) -> ReplyKeyboardMarkup:
         """기본 키보드 버튼 생성"""
         keyboard = [
-            [KeyboardButton("/모니터링"), KeyboardButton("/현황")],
-            [KeyboardButton("/설정"), KeyboardButton("/공항")],
-            [KeyboardButton("/취소"), KeyboardButton("/도움말")]
+            [KeyboardButton("/monitor"), KeyboardButton("/status")],
+            [KeyboardButton("/settings"), KeyboardButton("/airport")],
+            [KeyboardButton("/cancel"), KeyboardButton("/help")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     def get_admin_keyboard(self) -> ReplyKeyboardMarkup:
         """관리자용 키보드 버튼 생성"""
         keyboard = [
-            [KeyboardButton("/모니터링"), KeyboardButton("/현황")],
-            [KeyboardButton("/설정"), KeyboardButton("/공항")],
-            [KeyboardButton("/취소"), KeyboardButton("/도움말")],
-            [KeyboardButton("/전체현황"), KeyboardButton("/전체취소")]
+            [KeyboardButton("/monitor"), KeyboardButton("/status")],
+            [KeyboardButton("/settings"), KeyboardButton("/airport")],
+            [KeyboardButton("/cancel"), KeyboardButton("/help")],
+            [KeyboardButton("/allstatus"), KeyboardButton("/allcancel")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -231,21 +231,21 @@ class TelegramBot:
         if config_manager.ADMIN_IDS and user_id in config_manager.ADMIN_IDS:
             admin_help = (
                 "\n\n👑 *관리자 명령어*\n"
-                "• /전체현황 - 전체 모니터링 현황\n"
-                "• /전체취소 - 전체 모니터링 취소"
+                "• /allstatus - 전체 모니터링 현황\n"
+                "• /allcancel - 전체 모니터링 취소"
             )
         
         return (
             "✈️ *항공권 최저가 모니터링 봇*\n"
             "\n"
             "📝 *기본 명령어*\n"
-            "• /모니터링 - 새로운 모니터링 시작\n"
-            "• /현황 - 모니터링 현황 확인\n"
-            "• /취소 - 모니터링 취소\n"
+            "• /monitor - 새로운 모니터링 시작\n"
+            "• /status - 모니터링 현황 확인\n"
+            "• /cancel - 모니터링 취소\n"
             "\n"
             "⚙️ *설정 명령어*\n"
-            "• /설정 - 시간 제한 설정\n"
-            "• /공항 - 공항 코드 목록"
+            "• /settings - 시간 제한 설정\n"
+            "• /airport - 공항 코드 목록"
             + admin_help
         )
 
