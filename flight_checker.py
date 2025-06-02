@@ -43,7 +43,7 @@ from selenium_manager import (
 from utils import (
     load_json_data_async, save_json_data_async, save_user_config_async, get_user_config_async,
     get_user_config, save_user_config,
-    get_time_range, format_time_range, format_notification_setting,
+    get_time_range, format_time_range, format_notification_setting, format_notification_price_type,
     validate_url, valid_date, valid_airport,
     load_airports, get_airport_info, format_airport_list, AIRPORTS,
     RateLimiter, rate_limiter, rate_limit,
@@ -57,6 +57,7 @@ DEFAULT_USER_CONFIG = config_manager.DEFAULT_USER_CONFIG
 DEFAULT_NOTIFICATION_PREFERENCE = config_manager.DEFAULT_NOTIFICATION_PREFERENCE
 DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT = config_manager.DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT
 DEFAULT_NOTIFICATION_TARGET_PRICE = config_manager.DEFAULT_NOTIFICATION_TARGET_PRICE
+DEFAULT_NOTIFICATION_PRICE_TYPE = config_manager.DEFAULT_NOTIFICATION_PRICE_TYPE
 DATA_DIR = config_manager.DATA_DIR
 LOG_DIR = config_manager.LOG_DIR
 LOG_FILE = config_manager.LOG_FILE
@@ -94,35 +95,41 @@ async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "",
         "*현재 알림 설정*",
         f"• 알림 조건: {format_notification_setting(config)}",
+        f"• 알림 대상: {format_notification_price_type(config)}",
         "",
         "*현재 알림 주기 설정*",
         f"• 알림 주기: {config.get('notification_interval', 30)}분",
         "",
         "*시간 설정 방법*",
         "1️⃣ *시간대로 설정* (해당 시간대의 항공편만 검색)",
-        "• 가는 편: `/set 가는편 시간대 오전1 오전2`",
-        "• 오는 편: `/set 오는편 시간대 오후1 오후2 밤1`",
+        "• 가는 편: `/설정변경 가는편 시간대 오전1 오전2`",
+        "• 오는 편: `/설정변경 오는편 시간대 오후1 오후2 밤1`",
         "",
         "2️⃣ *특정 시각으로 설정*",
-        "• 가는 편: `/set 가는편 시각 9` (09:00 이전 출발)",
-        "• 오는 편: `/set 오는편 시각 15` (15:00 이후 출발)",
+        "• 가는 편: `/설정변경 가는편 시각 9` (09:00 이전 출발)",
+        "• 오는 편: `/설정변경 오는편 시각 15` (15:00 이후 출발)",
         "",
         "*알림 설정 방법*",
-        f"• 기본: `/set 알림조건 기본` ({DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT:,}원 이상 하락 시)",
-        f"• 하락 시: `/set 알림조건 하락시` (금액 무관)",
-        f"• 변동 시: `/set 알림조건 변동시` (상승/하락 모두)",
-        f"• 목표가: `/set 알림조건 목표가 150000` (15만원 이하 시)",
-        f"• 역대최저가: `/set 알림조건 역대최저가`",
-        f"• 하락기준 변경: `/set 알림조건 하락기준 3000` (3천원 이상 하락 시)",
+        f"• 기본: `/설정변경 알림조건 기본` ({DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT:,}원 이상 하락 시)",
+        f"• 하락 시: `/설정변경 알림조건 하락시` (금액 무관)",
+        f"• 변동 시: `/설정변경 알림조건 변동시` (상승/하락 모두)",
+        f"• 목표가: `/설정변경 알림조건 목표가 150000` (15만원 이하 시)",
+        f"• 역대최저가: `/설정변경 알림조건 역대최저가`",
+        f"• 하락기준 변경: `/설정변경 알림조건 하락기준 3000` (3천원 이상 하락 시)",
         "",
         "*알림 주기 설정 방법*",
-        "• `/set 알림주기 15` (15분마다 알림)",
+        "• `/설정변경 알림주기 15` (15분마다 알림)",
+        "",
+        "*알림 대상 설정 방법*",
+        "• 시간제한만: `/설정변경 알림대상 시간제한만` (기본값)",
+        "• 전체만: `/설정변경 알림대상 전체만`",
+        "• 둘다: `/설정변경 알림대상 둘다`",
         "",
         "*시간대 구분*",
         "• 새벽 (00-06), 오전1 (06-09)",
         "• 오전2 (09-12), 오후1 (12-15)",
         "• 오후2 (15-18), 밤1 (18-21)",
-        "• 밤2 (21-24)"    ]
+        "• 밤2 (21-24)"]
       # 관리자 여부에 따라 다른 키보드 표시
     keyboard = telegram_bot.get_keyboard_for_user(user_id)
     await update.message.reply_text(
@@ -139,7 +146,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(args) < 3: # 명령어, 설정종류, 값 (최소 3개)
         await update.message.reply_text(
             "❗ 올바른 형식으로 입력해주세요.\n"
-            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
         )
         return
     
@@ -152,7 +159,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(values) < 2: # 시각/시간대, 값 (최소 2개)
             await update.message.reply_text(
                 "❗ 시간 설정 형식이 올바르지 않습니다.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
             )
             return
 
@@ -183,7 +190,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if invalid_periods:
                 await update.message.reply_text(
                     f"❗ 올바르지 않은 시간대: {', '.join(invalid_periods)}\n"
-                    "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                    "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
                 )
                 return
             
@@ -194,7 +201,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "❗ 시간 설정은 '시각' 또는 '시간대'로만 가능합니다.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
             )
             return
 
@@ -202,7 +209,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not values: # 최소한 '기본' 등의 값이 있어야 함
             await update.message.reply_text(
                 "❗ 알림 조건을 입력해주세요.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
             )
             return
         
@@ -220,7 +227,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             config["notification_preference"] = "HISTORICAL_LOW_UPDATED"
         elif pref_type == "목표가":
             if len(values) < 2 or not values[1].isdigit():
-                await update.message.reply_text("❗ 목표 가격을 숫자로 입력해주세요. 예: `/set 알림조건 목표가 150000`")
+                await update.message.reply_text("❗ 목표 가격을 숫자로 입력해주세요. 예: `/설정변경 알림조건 목표가 150000`")
                 return
             target_price = int(values[1])
             if target_price <= 0:
@@ -230,7 +237,7 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             config["notification_target_price"] = target_price
         elif pref_type == "하락기준":
             if len(values) < 2 or not values[1].isdigit():
-                await update.message.reply_text("❗ 하락 기준 금액을 숫자로 입력해주세요. 예: `/set 알림조건 하락기준 3000`")
+                await update.message.reply_text("❗ 하락 기준 금액을 숫자로 입력해주세요. 예: `/설정변경 알림조건 하락기준 3000`")
                 return
             threshold = int(values[1])
             if threshold < 0: # 0원 하락도 의미는 있으나, 혼동 방지. 보통 양수로 입력.
@@ -241,16 +248,15 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 f"❗ 알 수 없는 알림 조건 타입: {pref_type}\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
             )
             return
         action_taken_msg = f"✅ 알림 조건이 변경되었습니다: {format_notification_setting(config)}"
-
     elif target_type == "알림주기":
         if len(values) != 1 or not values[0].isdigit():
             await update.message.reply_text(
                 "❗ 알림 주기는 숫자로 입력해주세요.\n"
-                "예: `/set 알림주기 15` (15분마다 알림)"
+                "예: `/설정변경 알림주기 15` (15분마다 알림)"
             )
             return
 
@@ -264,10 +270,34 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         config['notification_interval'] = interval
         action_taken_msg = f"✅ 알림 주기가 {interval}분으로 설정되었습니다."
 
+    elif target_type == "알림대상":
+        if not values: # 최소한 '시간제한만' 등의 값이 있어야 함
+            await update.message.reply_text(
+                "❗ 알림 대상을 입력해주세요.\n"
+                "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
+            )
+            return
+        
+        target_type_value = values[0]
+        
+        if target_type_value == "시간제한만":
+            config["notification_price_type"] = "RESTRICTED_ONLY"
+        elif target_type_value == "전체만":
+            config["notification_price_type"] = "OVERALL_ONLY"
+        elif target_type_value == "둘다":
+            config["notification_price_type"] = "BOTH"
+        else:
+            await update.message.reply_text(
+                f"❗ 알 수 없는 알림 대상 타입: {target_type_value}\n"
+                "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
+            )
+            return
+        action_taken_msg = f"✅ 알림 대상이 변경되었습니다: {format_notification_price_type(config)}"
+
     else:
         await update.message.reply_text(
             f"❗ 알 수 없는 설정 타입: {target_type}\n"
-            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            "자세한 설정 방법은 /설정 명령어로 확인하실 수 있습니다."
         )
         return
 
@@ -290,7 +320,7 @@ PATTERN = re.compile(
 )
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"사용자 {update.effective_user.id} 요청: /start")
+    logger.info(f"사용자 {update.effective_user.id} 요청: /시작")
     # 관리자 여부에 따라 다른 키보드 표시
     keyboard = telegram_bot.get_keyboard_for_user(update.effective_user.id)
     await update.message.reply_text(
@@ -300,7 +330,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"사용자 {update.effective_user.id} 요청: /help")
+    logger.info(f"사용자 {update.effective_user.id} 요청: /도움말")
     # 관리자 여부에 따라 다른 키보드 표시
     keyboard = telegram_bot.get_keyboard_for_user(update.effective_user.id)
     await update.message.reply_text(
@@ -312,7 +342,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @rate_limit
 async def monitor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"사용자 {user_id} 요청: /monitor")      # 현재 모니터링 개수 확인
+    logger.info(f"사용자 {user_id} 요청: /모니터링")      # 현재 모니터링 개수 확인
     existing = [p for p in DATA_DIR.iterdir() if PATTERN.fullmatch(p.name) and int(PATTERN.fullmatch(p.name).group('uid')) == user_id]
     if len(existing) >= config_manager.MAX_MONITORS:
         logger.warning(f"사용자 {user_id} 최대 모니터링 초과")
@@ -363,8 +393,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "✅ 올바른 형식: `ICN FUK 20251025 20251027`\n"
             "- 공항코드: 3자리 영문\n"
             "- 날짜: YYYYMMDD\n\n"
-            "💡 주요 공항 코드 목록은 /airport 명령으로 확인하실 수 있습니다.\n"
-            "다시 입력하시거나 /cancel 명령으로 취소하세요.",
+            "💡 주요 공항 코드 목록은 /공항 명령으로 확인하실 수 있습니다.\n"
+            "다시 입력하시거나 /취소 명령으로 취소하세요.",
             parse_mode="Markdown"
         )
         return SETTING
@@ -571,10 +601,16 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
             outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id, selenium_manager
         )
         
+        # 사용자 설정을 가져와서 알림 대상 타입 확인
+        user_config = await get_user_config_async(user_id)
+        notification_price_type = user_config.get("notification_price_type", DEFAULT_NOTIFICATION_PRICE_TYPE)
+        
         notify_msg_lines = []
         price_change_occurred = False
 
-        if restricted is not None and old_restr > 0 and old_restr - restricted >= 5000:
+        # 시간 제한 적용 최저가 변동 체크
+        restricted_drop = restricted is not None and old_restr > 0 and old_restr - restricted >= 5000
+        if restricted_drop and notification_price_type in ["RESTRICTED_ONLY", "BOTH"]:
             price_change_occurred = True
             notify_msg_lines.extend([
                 f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", "",
@@ -583,7 +619,9 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 r_info
             ])
 
-        if overall is not None and old_overall > 0 and old_overall - overall >= 5000:
+        # 전체 최저가 변동 체크
+        overall_drop = overall is not None and old_overall > 0 and old_overall - overall >= 5000
+        if overall_drop and notification_price_type in ["OVERALL_ONLY", "BOTH"]:
             if not price_change_occurred:
                  notify_msg_lines.extend([f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", ""])
             price_change_occurred = True
@@ -619,7 +657,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 "현재 설정하신 시간 조건에 맞는 항공권이 없습니다.",
                 f"• 가는 편 시간: {format_time_range(user_config, 'outbound')}",
                 f"• 오는 편 시간: {format_time_range(user_config, 'inbound')}",
-                "시간 설정을 변경하시려면 /settings 명령어를 사용해주세요.", "",
+                "시간 설정을 변경하시려면 /설정 명령어를 사용해주세요.", "",
                 f"📅 {outbound_date[:4]}/{outbound_date[4:6]}/{outbound_date[6:]} → {inbound_date[:4]}/{inbound_date[4:6]}/{inbound_date[6:]}",
                 f"🔗 [네이버 항공권]({naver_link})"
             ]
@@ -656,7 +694,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 @rate_limit
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"사용자 {user_id} 요청: /status")
+    logger.info(f"사용자 {user_id} 요청: /현황")
     
     # 비동기적으로 파일 목록 가져오기
     loop = asyncio.get_running_loop()
@@ -729,7 +767,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @rate_limit
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"사용자 {user_id} 요청: /cancel")
+    logger.info(f"사용자 {user_id} 요청: /취소")
     # 모니터링 파일 찾기
     files = sorted([
     p for p in DATA_DIR.iterdir()
@@ -739,7 +777,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         keyboard = telegram_bot.get_keyboard_for_user(user_id)
         await update.message.reply_text(
             "현재 실행 중인 모니터링이 없습니다.\n"
-            "새로운 모니터링을 시작하려면 /monitor 명령을 사용하세요.",
+            "새로운 모니터링을 시작하려면 /모니터링 명령을 사용하세요.",
             reply_markup=keyboard
         )
         return
@@ -878,7 +916,7 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"관리자 {user_id} 요청: /allstatus")
+    logger.info(f"관리자 {user_id} 요청: /전체현황")
     if user_id not in config_manager.ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
@@ -929,7 +967,7 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"관리자 {user_id} 요청: /allcancel")
+    logger.info(f"관리자 {user_id} 요청: /전체취소")
     if user_id not in config_manager.ADMIN_IDS:
         await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
         return
@@ -1258,7 +1296,7 @@ async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE):
 
 async def airport_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """등록된 주요 공항 코드 목록을 보여줍니다."""
-    logger.info(f"사용자 {update.effective_user.id} 요청: /airport")
+    logger.info(f"사용자 {update.effective_user.id} 요청: /공항")
     # airport 명령어 실행 시 키보드 유지
     keyboard = telegram_bot.get_keyboard_for_user(update.effective_user.id)
     await update.message.reply_text(
@@ -1298,32 +1336,34 @@ def main():
     
     # 핸들러 등록
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("monitor", monitor_cmd)],
+        entry_points=[CommandHandler("모니터링", monitor_cmd)],
         states={
             SETTING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, monitor_setting),
-                CommandHandler("cancel", cancel_conversation)
+                CommandHandler("취소", cancel_conversation)
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[CommandHandler("취소", cancel_conversation)],
     )
     
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("airport", airport_cmd))
-    application.add_handler(CommandHandler("settings", settings_cmd))
-    application.add_handler(CommandHandler("set", set_cmd))
-      # 콜백 쿼리 핸들러 추가 (패턴이 더 구체적인 것을 먼저 등록)
+    application.add_handler(CommandHandler("시작", start))
+    application.add_handler(CommandHandler("start", start))  # 영어 명령어도 지원
+    application.add_handler(CommandHandler("도움말", help_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))  # 영어 명령어도 지원
+    application.add_handler(CommandHandler("현황", status))
+    application.add_handler(CommandHandler("취소", cancel))
+    application.add_handler(CommandHandler("공항", airport_cmd))
+    application.add_handler(CommandHandler("설정", settings_cmd))
+    application.add_handler(CommandHandler("설정변경", set_cmd))
+    # 콜백 쿼리 핸들러 추가 (패턴이 더 구체적인 것을 먼저 등록)
     application.add_handler(CallbackQueryHandler(all_cancel_callback, pattern="^(confirm|cancel)_allcancel$"))
     application.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel_"))
     
     # 관리자 명령어
     if config_manager.ADMIN_IDS:
-        application.add_handler(CommandHandler("allstatus", all_status))
-        application.add_handler(CommandHandler("allcancel", all_cancel))
+        application.add_handler(CommandHandler("전체현황", all_status))
+        application.add_handler(CommandHandler("전체취소", all_cancel))
     
     # 매일 자정에 오래된 데이터 정리
     application.job_queue.run_daily(        cleanup_old_data,
