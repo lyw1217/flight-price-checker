@@ -102,15 +102,14 @@ def check_time_restrictions(dep_time: str, ret_time: str, config: dict) -> bool:
         # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
         is_valid_inbound = any(
             period_start <= ret_t.hour < period_end
-            for period in inbound_periods
-            for period_start, period_end in [TIME_PERIODS[period]]
+            for period in inbound_periods            for period_start, period_end in [TIME_PERIODS[period]]
         )
         if not is_valid_inbound:
             logger.debug(f"오는 편 시간대 미매칭: {ret_t}는 선택된 시간대 {inbound_periods}에 포함되지 않음")
             return False
             
     else:  # exact
-        # 시각 설정: 가는 편은 설정 시각 이전, 오는 편은 설정 시각 이후
+        # 시각 설정: 가는 편은 설정 시각 이하, 오는 편은 설정 시각 이상
         outbound_limit = time(hour=config['outbound_exact_hour'], minute=0)
         if dep_t > outbound_limit:
             logger.debug(f"가는 편 시각 미매칭: {dep_t} > {outbound_limit}")
