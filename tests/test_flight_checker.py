@@ -498,5 +498,185 @@ class TestFlightChecker(unittest.TestCase):
         self.message_manager.clear_status_message(user_id)
         self.assertNotIn(user_id, self.message_manager.status_messages)
 
+    def test_config_manager_integration_time_type_exact(self):
+        """config_manager를 사용한 통합 테스트 - time_type이 exact인 경우"""
+        user_id = 98765
+        
+        # 1. exact 설정 저장
+        exact_config = {
+            "time_type": "exact",
+            "outbound_exact_hour": 11,
+            "inbound_exact_hour": 14,
+            "outbound_periods": ["오전1"],  # exact 모드에서는 사용되지 않음
+            "inbound_periods": ["오후1"]   # exact 모드에서는 사용되지 않음
+        }
+        self.save_user_config(user_id, exact_config)
+        
+        # 2. 설정 로드
+        loaded_config = self.get_user_config(user_id)
+        
+        # 3. 로드된 설정 검증
+        self.assertEqual(loaded_config['time_type'], 'exact')
+        self.assertEqual(loaded_config['outbound_exact_hour'], 11)
+        self.assertEqual(loaded_config['inbound_exact_hour'], 14)
+        
+        # 4. 로드된 설정으로 시간 체크 테스트
+        # exact 모드에서는 outbound_exact_hour 이하, inbound_exact_hour 이상이어야 함
+        self.assertTrue(self.check_time_restrictions("10:30", "14:30", loaded_config))   # 조건 만족
+        self.assertTrue(self.check_time_restrictions("11:00", "14:00", loaded_config))   # 경계값 포함
+        self.assertFalse(self.check_time_restrictions("11:30", "14:30", loaded_config))  # 가는 편이 11시 초과
+        self.assertFalse(self.check_time_restrictions("10:30", "13:30", loaded_config))  # 오는 편이 14시 미만
+        
+        # 5. period 설정이 무시되는지 확인
+        # exact 모드에서는 periods가 설정되어 있어도 무시되어야 함
+        period_time_that_would_fail_in_period_mode = ("10:30", "14:30")  # 오전1(6-9), 오후1(12-15) 범위에 맞지 않음
+        self.assertTrue(self.check_time_restrictions(*period_time_that_would_fail_in_period_mode, loaded_config))
+
+    def test_config_manager_integration_time_type_time_period(self):
+        """config_manager를 사용한 통합 테스트 - time_type이 time_period인 경우"""
+        user_id = 54321
+        
+        # 1. time_period 설정 저장
+        period_config = {
+            "time_type": "time_period",
+            "outbound_periods": ["오전1", "오전2"],  # 6-12시
+            "inbound_periods": ["오후1", "오후2"],   # 12-18시
+            "outbound_exact_hour": 9,   # time_period 모드에서는 사용되지 않음
+            "inbound_exact_hour": 15    # time_period 모드에서는 사용되지 않음
+        }
+        self.save_user_config(user_id, period_config)
+        
+        # 2. 설정 로드
+        loaded_config = self.get_user_config(user_id)
+        
+        # 3. 로드된 설정 검증
+        self.assertEqual(loaded_config['time_type'], 'time_period')
+        self.assertEqual(loaded_config['outbound_periods'], ["오전1", "오전2"])
+        self.assertEqual(loaded_config['inbound_periods'], ["오후1", "오후2"])
+        
+        # 4. 로드된 설정으로 시간 체크 테스트
+        # time_period 모드에서는 지정된 시간대 범위 내에 있어야 함
+        self.assertTrue(self.check_time_restrictions("07:00", "13:00", loaded_config))   # 오전1(6-9) + 오후1(12-15)
+        self.assertTrue(self.check_time_restrictions("10:30", "16:30", loaded_config))   # 오전2(9-12) + 오후2(15-18)
+        self.assertTrue(self.check_time_restrictions("06:00", "12:00", loaded_config))   # 경계값들
+        self.assertTrue(self.check_time_restrictions("11:59", "17:59", loaded_config))   # 경계값들
+        
+        self.assertFalse(self.check_time_restrictions("05:30", "13:00", loaded_config))  # 가는 편이 6시 이전
+        self.assertFalse(self.check_time_restrictions("12:30", "13:00", loaded_config))  # 가는 편이 12시 이후
+        self.assertFalse(self.check_time_restrictions("07:00", "11:30", loaded_config))  # 오는 편이 12시 이전
+        self.assertFalse(self.check_time_restrictions("07:00", "18:30", loaded_config))  # 오는 편이 18시 이후
+        
+        # 5. exact 설정이 무시되는지 확인
+        # time_period 모드에서는 exact_hour가 설정되어 있어도 무시되어야 함
+        exact_time_that_would_fail_in_exact_mode = ("10:30", "13:00")  # exact(9시 이하, 15시 이상)에 맞지 않음
+        self.assertTrue(self.check_time_restrictions(*exact_time_that_would_fail_in_exact_mode, loaded_config))
+
+    def test_config_manager_integration_config_persistence(self):
+        """config_manager를 사용한 설정 영속성 테스트"""
+        user_id = 11111
+        
+        # 1. 초기 설정 저장
+        initial_config = {
+            "time_type": "exact",
+            "outbound_exact_hour": 8,
+            "inbound_exact_hour": 18,
+            "outbound_periods": ["새벽"],
+            "inbound_periods": ["밤2"]
+        }
+        self.save_user_config(user_id, initial_config)
+        
+        # 2. 첫 번째 로드 및 검증
+        config_1 = self.get_user_config(user_id)
+        self.assertEqual(config_1['time_type'], 'exact')
+        self.assertEqual(config_1['outbound_exact_hour'], 8)
+        self.assertEqual(config_1['inbound_exact_hour'], 18)
+        
+        # 3. 설정 변경 및 재저장
+        modified_config = config_1.copy()
+        modified_config['time_type'] = 'time_period'
+        modified_config['outbound_periods'] = ['오전2', '오후1']
+        modified_config['inbound_periods'] = ['오후2', '밤1']
+        self.save_user_config(user_id, modified_config)
+        
+        # 4. 두 번째 로드 및 변경사항 검증
+        config_2 = self.get_user_config(user_id)
+        self.assertEqual(config_2['time_type'], 'time_period')
+        self.assertEqual(config_2['outbound_periods'], ['오전2', '오후1'])
+        self.assertEqual(config_2['inbound_periods'], ['오후2', '밤1'])
+        
+        # 5. 시간 체크로 실제 동작 검증
+        # time_period 모드로 변경되었으므로 period 설정이 적용되어야 함
+        self.assertTrue(self.check_time_restrictions("10:00", "16:00", config_2))   # 오전2(9-12) + 오후2(15-18)
+        self.assertTrue(self.check_time_restrictions("13:30", "19:30", config_2))   # 오후1(12-15) + 밤1(18-21)
+        self.assertFalse(self.check_time_restrictions("07:30", "16:00", config_2))  # 가는 편이 설정 범위 밖
+        
+        # 6. 메타데이터 검증
+        self.assertIn('created_at', config_2)
+        self.assertIn('last_activity', config_2)
+        self.assertIsNotNone(config_2['created_at'])
+        self.assertIsNotNone(config_2['last_activity'])
+
+    def test_config_manager_integration_default_config_handling(self):
+        """config_manager를 사용한 기본 설정 처리 테스트"""
+        user_id = 22222
+        
+        # 1. 존재하지 않는 사용자의 설정 로드 (기본 설정 반환)
+        config = self.get_user_config(user_id)
+        
+        # 2. 기본 설정 검증
+        self.assertEqual(config['time_type'], self.DEFAULT_USER_CONFIG['time_type'])
+        self.assertEqual(config['outbound_periods'], self.DEFAULT_USER_CONFIG['outbound_periods'])
+        self.assertEqual(config['inbound_periods'], self.DEFAULT_USER_CONFIG['inbound_periods'])
+        self.assertEqual(config['outbound_exact_hour'], self.DEFAULT_USER_CONFIG['outbound_exact_hour'])
+        self.assertEqual(config['inbound_exact_hour'], self.DEFAULT_USER_CONFIG['inbound_exact_hour'])
+        
+        # 3. 메타데이터가 자동 생성되었는지 확인
+        self.assertIn('created_at', config)
+        self.assertIn('last_activity', config)
+        
+        # 4. 기본 설정으로 시간 체크 테스트
+        # DEFAULT_USER_CONFIG의 time_type에 따라 테스트
+        if self.DEFAULT_USER_CONFIG['time_type'] == 'time_period':
+            # 기본 periods 설정을 확인
+            default_outbound = self.DEFAULT_USER_CONFIG['outbound_periods']
+            default_inbound = self.DEFAULT_USER_CONFIG['inbound_periods']
+            
+            # 각 시간대의 실제 시간 범위를 확인하여 테스트
+            valid_outbound_time = "07:00" if "오전1" in default_outbound else "10:00"
+            valid_inbound_time = "13:00" if "오후1" in default_inbound else "16:00"
+            
+            # 기본 설정에 맞는 시간으로 테스트
+            result = self.check_time_restrictions(valid_outbound_time, valid_inbound_time, config)
+            # 결과가 True 또는 False든 상관없이, 에러 없이 실행되어야 함
+            self.assertIsInstance(result, bool)
+        
+        elif self.DEFAULT_USER_CONFIG['time_type'] == 'exact':
+            # 기본 exact 설정으로 테스트
+            default_out_hour = self.DEFAULT_USER_CONFIG['outbound_exact_hour']
+            default_in_hour = self.DEFAULT_USER_CONFIG['inbound_exact_hour']
+            
+            # 조건을 만족하는 시간으로 테스트
+            valid_out_time = f"{default_out_hour-1:02d}:00"
+            valid_in_time = f"{default_in_hour+1:02d}:00"
+            
+            result = self.check_time_restrictions(valid_out_time, valid_in_time, config)
+            self.assertTrue(result)
+
+    def test_config_manager_integration_user_id_none_handling(self):
+        """config_manager를 사용한 user_id가 None인 경우 처리 테스트"""
+        
+        # 1. user_id가 None인 경우 설정 로드
+        config = self.get_user_config(None)
+        
+        # 2. 기본 설정이 반환되는지 확인
+        self.assertEqual(config['time_type'], self.DEFAULT_USER_CONFIG['time_type'])
+        self.assertEqual(config['outbound_periods'], self.DEFAULT_USER_CONFIG['outbound_periods'])
+        self.assertEqual(config['inbound_periods'], self.DEFAULT_USER_CONFIG['inbound_periods'])
+        
+        # 3. None user_id로 시간 체크 테스트
+        # 기본 설정이 정상적으로 동작하는지 확인
+        result = self.check_time_restrictions("08:00", "15:00", config)
+        self.assertIsInstance(result, bool)
+
 if __name__ == "__main__":
-    unittest.main() 
+    unittest.main()

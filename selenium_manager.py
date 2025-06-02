@@ -98,11 +98,11 @@ def check_time_restrictions(dep_time: str, ret_time: str, config: dict) -> bool:
         if not is_valid_outbound:
             logger.debug(f"가는 편 시간대 미매칭: {dep_t}는 선택된 시간대 {outbound_periods}에 포함되지 않음")
             return False
-            
-        # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
+              # 오는 편: 선택된 시간대 중 하나라도 포함되면 유효
         is_valid_inbound = any(
             period_start <= ret_t.hour < period_end
-            for period in inbound_periods            for period_start, period_end in [TIME_PERIODS[period]]
+            for period in inbound_periods
+            for period_start, period_end in [TIME_PERIODS[period]]
         )
         if not is_valid_inbound:
             logger.debug(f"오는 편 시간대 미매칭: {ret_t}는 선택된 시간대 {inbound_periods}에 포함되지 않음")
@@ -276,14 +276,15 @@ async def fetch_prices(depart: str, arrive: str, d_date: str, r_date: str, max_r
         f"https://flight.naver.com/flights/international/"
         f"{depart}-{arrive}-{d_date}/{arrive}-{depart}-{r_date}?adult=1&fareType=Y"
     )
-    
-    # config_manager에서 사용자 설정 로드하는 함수를 임포트해야 하는데,
-    # 순환 임포트를 피하기 위해 매개변수로 받거나 config 인자를 직접 받도록 수정
+      # 사용자 설정 로드
     if user_id:
-        # 기본 config를 사용하거나, 호출하는 쪽에서 config를 전달받도록 수정
-        config = DEFAULT_USER_CONFIG.copy()
+        # config_manager를 통해 실제 사용자 설정 가져오기
+        config = config_manager.get_user_config(user_id)
+        logger.debug(f"사용자 {user_id}의 설정 로드: time_type={config.get('time_type', 'unknown')}")
     else:
+        # user_id가 없으면 기본 설정 사용
         config = DEFAULT_USER_CONFIG.copy()
+        logger.debug("기본 설정 사용")
     
     if selenium_manager is None:
         raise ValueError("selenium_manager 인스턴스가 필요합니다")
