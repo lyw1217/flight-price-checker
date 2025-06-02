@@ -143,11 +143,13 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """설정 변경"""
     user_id = update.effective_user.id
     args = update.message.text.strip().split()
-    
+    keyboard = telegram_bot.get_keyboard_for_user(user_id) # 키보드 가져오기
+
     if len(args) < 3: # 명령어, 설정종류, 값 (최소 3개)
         await update.message.reply_text(
             "❗ 올바른 형식으로 입력해주세요.\n"
-            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+            reply_markup=keyboard
         )
         return
     
@@ -160,7 +162,8 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(values) < 2: # 시각/시간대, 값 (최소 2개)
             await update.message.reply_text(
                 "❗ 시간 설정 형식이 올바르지 않습니다.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                reply_markup=keyboard
             )
             return
 
@@ -170,12 +173,12 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if set_type == "시각":
             if len(time_values) != 1 or not time_values[0].isdigit():
-                await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
+                await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.", reply_markup=keyboard)
                 return
             
             hour = int(time_values[0])
             if hour < 0 or hour > 23:
-                await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.")
+                await update.message.reply_text("❗ 시각은 0-23 사이의 숫자로 입력해주세요.", reply_markup=keyboard)
                 return
             
             config['time_type'] = 'exact'
@@ -184,14 +187,15 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         elif set_type == "시간대":
             if not time_values:
-                await update.message.reply_text("❗ 하나 이상의 시간대를 선택해주세요.")
+                await update.message.reply_text("❗ 하나 이상의 시간대를 선택해주세요.", reply_markup=keyboard)
                 return
             
             invalid_periods = [p for p in time_values if p not in TIME_PERIODS]
             if invalid_periods:
                 await update.message.reply_text(
                     f"❗ 올바르지 않은 시간대: {', '.join(invalid_periods)}\n"
-                    "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                    "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                    reply_markup=keyboard
                 )
                 return
             
@@ -202,7 +206,8 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "❗ 시간 설정은 '시각' 또는 '시간대'로만 가능합니다.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                reply_markup=keyboard
             )
             return
 
@@ -210,7 +215,8 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not values: # 최소한 '기본' 등의 값이 있어야 함
             await update.message.reply_text(
                 "❗ 알림 조건을 입력해주세요.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                reply_markup=keyboard
             )
             return
         
@@ -228,28 +234,29 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             config["notification_preference"] = "HISTORICAL_LOW_UPDATED"
         elif pref_type == "목표가":
             if len(values) < 2 or not values[1].isdigit():
-                await update.message.reply_text("❗ 목표 가격을 숫자로 입력해주세요. 예: `/set 알림조건 목표가 150000`")
+                await update.message.reply_text("❗ 목표 가격을 숫자로 입력해주세요. 예: `/set 알림조건 목표가 150000`", reply_markup=keyboard)
                 return
             target_price = int(values[1])
             if target_price <= 0:
-                await update.message.reply_text("❗ 목표 가격은 0보다 커야 합니다.")
+                await update.message.reply_text("❗ 목표 가격은 0보다 커야 합니다.", reply_markup=keyboard)
                 return
             config["notification_preference"] = "TARGET_PRICE_REACHED"
             config["notification_target_price"] = target_price
         elif pref_type == "하락기준":
             if len(values) < 2 or not values[1].isdigit():
-                await update.message.reply_text("❗ 하락 기준 금액을 숫자로 입력해주세요. 예: `/set 알림조건 하락기준 3000`")
+                await update.message.reply_text("❗ 하락 기준 금액을 숫자로 입력해주세요. 예: `/set 알림조건 하락기준 3000`", reply_markup=keyboard)
                 return
             threshold = int(values[1])
             if threshold < 0: # 0원 하락도 의미는 있으나, 혼동 방지. 보통 양수로 입력.
-                await update.message.reply_text("❗ 하락 기준 금액은 0 이상이어야 합니다.")
+                await update.message.reply_text("❗ 하락 기준 금액은 0 이상이어야 합니다.", reply_markup=keyboard)
                 return
             config["notification_preference"] = "PRICE_DROP_THRESHOLD" # 하락기준 변경 시 자동으로 이 타입으로 설정
             config["notification_threshold_amount"] = threshold
         else:
             await update.message.reply_text(
                 f"❗ 알 수 없는 알림 조건 타입: {pref_type}\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                reply_markup=keyboard
             )
             return
         action_taken_msg = f"✅ 알림 조건이 변경되었습니다: {format_notification_setting(config)}"
@@ -258,14 +265,16 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(values) != 1 or not values[0].isdigit():
             await update.message.reply_text(
                 "❗ 알림 주기는 숫자로 입력해주세요.\n"
-                "예: `/set 알림주기 15` (15분마다 알림)"
+                "예: `/set 알림주기 15` (15분마다 알림)",
+                reply_markup=keyboard
             )
             return
 
         interval = int(values[0])
         if interval < 5 or interval > 1440:  # 5분 ~ 24시간 제한
             await update.message.reply_text(
-                "❗ 알림 주기는 5분 이상, 1440분 이하로 설정해주세요."
+                "❗ 알림 주기는 5분 이상, 1440분 이하로 설정해주세요.",
+                reply_markup=keyboard
             )
             return
 
@@ -276,7 +285,8 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not values: # 최소한 '시간제한만' 등의 값이 있어야 함
             await update.message.reply_text(
                 "❗ 알림 대상을 입력해주세요.\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                reply_markup=keyboard
             )
             return
         
@@ -291,7 +301,8 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 f"❗ 알 수 없는 알림 대상 타입: {target_type_value}\n"
-                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+                reply_markup=keyboard
             )
             return
         action_taken_msg = f"✅ 알림 대상이 변경되었습니다: {format_notification_price_type(config)}"
@@ -299,16 +310,18 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             f"❗ 알 수 없는 설정 타입: {target_type}\n"
-            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다.",
+            reply_markup=keyboard
         )
         return
 
     if action_taken_msg: # 변경 사항이 있을 때만 저장 및 메시지 응답
         await save_user_config_async(user_id, config)
-        await update.message.reply_text(action_taken_msg)
+        await update.message.reply_text(action_taken_msg, reply_markup=keyboard)
     else:
         await update.message.reply_text(
-            "❗ 설정 변경에 실패했습니다. 올바른 명령어인지 확인해주세요."
+            "❗ 설정 변경에 실패했습니다. 올바른 명령어인지 확인해주세요.",
+            reply_markup=keyboard
         )
 
 # 로거 인스턴스 생성
@@ -873,7 +886,8 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         monitors.pop(user_id, None)
         await query.message.edit_text(
             "\n".join(msg_lines),
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
         await query.answer("모든 모니터링이 취소되었습니다.")
         return
@@ -913,15 +927,17 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         await query.message.edit_text(
             "\n".join(msg_lines),
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
         await query.answer("모니터링이 취소되었습니다.")
 
 async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"관리자 {user_id} 요청: /allstatus")
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
     if user_id not in config_manager.ADMIN_IDS:
-        await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
+        await update.message.reply_text("❌ 관리자 권한이 필요합니다.", reply_markup=keyboard)
         return
 
     # 모든 모니터링 파일 찾기 (비동기적으로)
@@ -932,7 +948,7 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     if not files:
-        await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
+        await update.message.reply_text("현재 등록된 모니터링이 없습니다.", reply_markup=keyboard)
         return
 
     # 사용자별 모니터링 개수 집계
@@ -965,14 +981,16 @@ async def all_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "\n".join(msg_lines),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
 
 async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"관리자 {user_id} 요청: /allcancel")
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
     if user_id not in config_manager.ADMIN_IDS:
-        await update.message.reply_text("❌ 관리자 권한이 필요합니다.")
+        await update.message.reply_text("❌ 관리자 권한이 필요합니다.", reply_markup=keyboard)
         return
 
     # 모든 모니터링 파일 찾기 (비동기적으로)
@@ -983,11 +1001,11 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     if not files:
-        await update.message.reply_text("현재 등록된 모니터링이 없습니다.")
+        await update.message.reply_text("현재 등록된 모니터링이 없습니다.", reply_markup=keyboard)
         return
 
     # 확인 버튼이 있는 인라인 키보드 생성
-    keyboard = [
+    inline_keyboard = [
         [
             InlineKeyboardButton("✅ 예, 모두 취소합니다", callback_data="confirm_allcancel"),
             InlineKeyboardButton("❌ 아니오", callback_data="cancel_allcancel")
@@ -997,13 +1015,14 @@ async def all_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚠️ *주의*: 정말 모든 모니터링({len(files)}건)을 취소하시겠습니까?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard) # 인라인 키보드는 유지
     )
 
 async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """전체 모니터링 취소 요청(인라인 버튼 콜백)을 처리합니다."""
     query = update.callback_query
     user_id = query.from_user.id
+    keyboard = telegram_bot.get_keyboard_for_user(user_id)
     
     if user_id not in config_manager.ADMIN_IDS:
         await query.answer("❌ 관리자 권한이 필요합니다.")
@@ -1015,7 +1034,6 @@ async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "모니터링 취소가 취소되었습니다."
         )
         # 새로운 메시지로 관리자 키보드 표시
-        keyboard = telegram_bot.get_keyboard_for_user(query.from_user.id)
         await query.message.reply_text(
             "다른 작업을 선택해주세요.",
             reply_markup=keyboard
@@ -1068,7 +1086,6 @@ async def all_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "\n".join(msg_parts)
     )
     # 새로운 메시지로 관리자 키보드 표시
-    keyboard = telegram_bot.get_keyboard_for_user(query.from_user.id)
     await query.message.reply_text(
         "다른 작업을 선택해주세요.",
         reply_markup=keyboard
