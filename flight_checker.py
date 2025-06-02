@@ -43,7 +43,7 @@ from selenium_manager import (
 from utils import (
     load_json_data_async, save_json_data_async, save_user_config_async, get_user_config_async,
     get_user_config, save_user_config,
-    get_time_range, format_time_range, format_notification_setting,
+    get_time_range, format_time_range, format_notification_setting, format_notification_price_type,
     validate_url, valid_date, valid_airport,
     load_airports, get_airport_info, format_airport_list, AIRPORTS,
     RateLimiter, rate_limiter, rate_limit,
@@ -57,6 +57,7 @@ DEFAULT_USER_CONFIG = config_manager.DEFAULT_USER_CONFIG
 DEFAULT_NOTIFICATION_PREFERENCE = config_manager.DEFAULT_NOTIFICATION_PREFERENCE
 DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT = config_manager.DEFAULT_NOTIFICATION_THRESHOLD_AMOUNT
 DEFAULT_NOTIFICATION_TARGET_PRICE = config_manager.DEFAULT_NOTIFICATION_TARGET_PRICE
+DEFAULT_NOTIFICATION_PRICE_TYPE = config_manager.DEFAULT_NOTIFICATION_PRICE_TYPE
 DATA_DIR = config_manager.DATA_DIR
 LOG_DIR = config_manager.LOG_DIR
 LOG_FILE = config_manager.LOG_FILE
@@ -94,6 +95,7 @@ async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "",
         "*현재 알림 설정*",
         f"• 알림 조건: {format_notification_setting(config)}",
+        f"• 알림 대상: {format_notification_price_type(config)}",
         "",
         "*현재 알림 주기 설정*",
         f"• 알림 주기: {config.get('notification_interval', 30)}분",
@@ -118,12 +120,18 @@ async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*알림 주기 설정 방법*",
         "• `/set 알림주기 15` (15분마다 알림)",
         "",
+        "*알림 대상 설정 방법*",
+        "• 시간제한만: `/설정변경 알림대상 시간제한만` (기본값)",
+        "• 전체만: `/설정변경 알림대상 전체만`",
+        "• 둘다: `/설정변경 알림대상 둘다`",
+        "",
         "*시간대 구분*",
         "• 새벽 (00-06), 오전1 (06-09)",
         "• 오전2 (09-12), 오후1 (12-15)",
         "• 오후2 (15-18), 밤1 (18-21)",
-        "• 밤2 (21-24)"    ]
-      # 관리자 여부에 따라 다른 키보드 표시
+        "• 밤2 (21-24)"]
+    
+    # 관리자 여부에 따라 다른 키보드 표시
     keyboard = telegram_bot.get_keyboard_for_user(user_id)
     await update.message.reply_text(
         "\n".join(msg_lines),
@@ -263,6 +271,30 @@ async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         config['notification_interval'] = interval
         action_taken_msg = f"✅ 알림 주기가 {interval}분으로 설정되었습니다."
+
+    elif target_type == "알림대상":
+        if not values: # 최소한 '시간제한만' 등의 값이 있어야 함
+            await update.message.reply_text(
+                "❗ 알림 대상을 입력해주세요.\n"
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            )
+            return
+        
+        target_type_value = values[0]
+        
+        if target_type_value == "시간제한만":
+            config["notification_price_type"] = "RESTRICTED_ONLY"
+        elif target_type_value == "전체만":
+            config["notification_price_type"] = "OVERALL_ONLY"
+        elif target_type_value == "둘다":
+            config["notification_price_type"] = "BOTH"
+        else:
+            await update.message.reply_text(
+                f"❗ 알 수 없는 알림 대상 타입: {target_type_value}\n"
+                "자세한 설정 방법은 /settings 명령어로 확인하실 수 있습니다."
+            )
+            return
+        action_taken_msg = f"✅ 알림 대상이 변경되었습니다: {format_notification_price_type(config)}"
 
     else:
         await update.message.reply_text(
@@ -570,11 +602,17 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         restricted, r_info, overall, o_info, link = await fetch_prices(
             outbound_dep, outbound_arr, outbound_date, inbound_date, 3, user_id, selenium_manager
         )
+
+        # 사용자 설정을 가져와서 알림 대상 타입 확인
+        user_config = await get_user_config_async(user_id)
+        notification_price_type = user_config.get("notification_price_type", DEFAULT_NOTIFICATION_PRICE_TYPE)
         
         notify_msg_lines = []
         price_change_occurred = False
 
-        if restricted is not None and old_restr > 0 and old_restr - restricted >= 5000:
+        # 시간 제한 적용 최저가 변동 체크
+        restricted_drop = restricted is not None and old_restr > 0 and old_restr - restricted >= 5000
+        if restricted_drop and notification_price_type in ["RESTRICTED_ONLY", "BOTH"]:
             price_change_occurred = True
             notify_msg_lines.extend([
                 f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", "",
@@ -583,7 +621,10 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 r_info
             ])
 
-        if overall is not None and old_overall > 0 and old_overall - overall >= 5000:
+        
+        # 전체 최저가 변동 체크
+        overall_drop = overall is not None and old_overall > 0 and old_overall - overall >= 5000
+        if overall_drop and notification_price_type in ["OVERALL_ONLY", "BOTH"]:
             if not price_change_occurred:
                  notify_msg_lines.extend([f"📉 *{dep_city} ↔ {arr_city} 가격 하락 알림*", ""])
             price_change_occurred = True
