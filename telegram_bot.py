@@ -285,6 +285,10 @@ class MessageManager:
             
             if current_message:
                 # 기존 메시지 편집 시도
+                # edit_message_text는 InlineKeyboardMarkup만 허용하므로, 타입 체크 후 전달
+                if reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):
+                    reply_markup = None
+
                 updated_message = await telegram_bot.safe_edit_message(
                     current_message, 
                     text, 
