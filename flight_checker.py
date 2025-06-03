@@ -882,11 +882,16 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             hist.unlink()
             for job in ctx.application.job_queue.get_jobs_by_name(str(hist)):
                 job.schedule_removal()
-        
         monitors.pop(user_id, None)
+        # 인라인 키보드 제거하면서 메시지 편집
         await query.message.edit_text(
             "\n".join(msg_lines),
             parse_mode="Markdown",
+            reply_markup=None
+        )
+        # 새로운 메시지로 일반 키보드 표시
+        await query.message.reply_text(
+            "다른 작업을 선택해주세요.",
             reply_markup=keyboard
         )
         await query.answer("모든 모니터링이 취소되었습니다.")
@@ -918,16 +923,21 @@ async def cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             monitors[user_id] = [m for m in user_mons if m.get('hist_path') != str(target)]
             if not monitors[user_id]:
                 monitors.pop(user_id)
-                
         msg_lines = [
             "✅ 다음 모니터링이 취소되었습니다:",
             f"• {dep_city}({dep}) → {arr_city}({arr})",
             f"  {dd[:4]}/{dd[4:6]}/{dd[6:]} ~ {rd[:4]}/{rd[4:6]}/{rd[6:]}"
         ]
         
+        # 인라인 키보드 제거하면서 메시지 편집
         await query.message.edit_text(
             "\n".join(msg_lines),
             parse_mode="Markdown",
+            reply_markup=None
+        )
+        # 새로운 메시지로 일반 키보드 표시
+        await query.message.reply_text(
+            "다른 작업을 선택해주세요.",
             reply_markup=keyboard
         )
         await query.answer("모니터링이 취소되었습니다.")
