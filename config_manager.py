@@ -220,7 +220,7 @@ class ConfigManager:
                 logging.StreamHandler()
             ]
         )
-          # httpx 로거의 레벨을 WARNING으로 설정하여 INFO 로그 비활성화
+        # httpx 로거의 레벨을 WARNING으로 설정하여 INFO 로그 비활성화
         logging.getLogger("httpx").setLevel(logging.WARNING)
     
     def rotate_logs(self):
@@ -233,12 +233,15 @@ class ConfigManager:
             new = self.LOG_FILE.with_suffix(f'.log.{i+1}')
             if old.exists():
                 old.rename(new)
+        
         if self.LOG_FILE.exists():
             self.LOG_FILE.rename(self.LOG_FILE.with_suffix('.log.1'))
     
     @contextlib.contextmanager
     def file_lock(self, file_path: Path):
         """파일 잠금 컨텍스트 매니저 (크로스 플랫폼)"""
+        # 디렉토리가 없으면 생성
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         lock_file = file_path.with_suffix(file_path.suffix + '.lock')
         try:
             with open(lock_file, 'w') as f:
