@@ -780,22 +780,22 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if data.get('restricted', 0):
                 restricted_price_line = f"🎯 조건부: {data['restricted']:,}원"
                 if data.get('restricted_info'):
-                    restricted_price_line += f"\\n   └ {data['restricted_info']}"
+                    restricted_price_line += f"\n   └ {data['restricted_info']}"
                 price_details.append(restricted_price_line)
             
             if data.get('overall', 0):
                 overall_price_line = f"📌 전체: {data['overall']:,}원"
                 if data.get('overall_info'):
-                    overall_price_line += f"\\n   └ {data['overall_info']}"
+                    overall_price_line += f"\n   └ {data['overall_info']}"
                 price_details.append(overall_price_line)
             
-            price_info_display = "\\n".join(price_details) if price_details else "조회된 가격 없음"
+            price_info_display = "\n".join(price_details) if price_details else "조회된 가격 없음"
 
             msg_lines.extend([
                 "",
                 f"*{idx}. {dep_city}({dep}) ↔ {arr_city}({arr})*",
                 f"📅 {dd_fmt} → {rd_fmt}",
-                f"💰 최저가 현황:\\n{price_info_display}",
+                f"💰 최저가 현황:\n{price_info_display}",
                 f"⏱️ {elapsed}일째 진행 중",
                 f"🔄 마지막 조회: {data['last_fetch']}",
                 f"[🔗 네이버 항공권](https://flight.naver.com/flights/international/{dep}-{arr}-{dd}/{arr}-{dep}-{rd}?adult=1&fareType=Y)"
