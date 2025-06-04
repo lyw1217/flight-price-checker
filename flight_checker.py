@@ -785,7 +785,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if data.get('restricted', 0):
                     restricted_price_line = f"🎯 조건부: {data['restricted']:,}원"
                     if data.get('restricted_info'):
-                        restricted_price_line += f"\\n   └ {data['restricted_info']}"
+                        restricted_price_line += f"\n🛫 {data['restricted_info']}"
                     price_details.append(restricted_price_line)
                 elif notification_price_type == "RESTRICTED_ONLY":
                     price_details.append("🎯 조건부: 조회된 가격 없음")
@@ -795,12 +795,12 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if data.get('overall', 0):
                     overall_price_line = f"📌 전체: {data['overall']:,}원"
                     if data.get('overall_info'):
-                        overall_price_line += f"\\n   └ {data['overall_info']}"
+                        overall_price_line += f"\n🛫 {data['overall_info']}"
                     price_details.append(overall_price_line)
                 elif notification_price_type == "OVERALL_ONLY":
                     price_details.append("📌 전체: 조회된 가격 없음")
             
-            price_info_display = "\\n".join(price_details) if price_details else "표시할 가격 정보가 없거나, 알림 설정에 따라 생략되었습니다."
+            price_info_display = "\n".join(price_details) if price_details else "표시할 가격 정보가 없거나, 알림 설정에 따라 생략되었습니다."
 
             msg_lines.extend([
                 "",
