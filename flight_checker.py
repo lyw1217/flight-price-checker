@@ -738,7 +738,11 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"사용자 {user_id} 요청: /status")
-    
+
+    # 사용자 설정 가져오기
+    user_config = await get_user_config_async(user_id)
+    notification_price_type = user_config.get("notification_price_type", DEFAULT_NOTIFICATION_PRICE_TYPE)
+
     # 비동기적으로 파일 목록 가져오기
     loop = asyncio.get_running_loop()
     files = await loop.run_in_executor(
@@ -775,21 +779,28 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             dd, rd = info['dd'], info['rd']
             dd_fmt = f"{dd[2:4]}.{dd[4:6]}.{dd[6:]}"
             rd_fmt = f"{rd[2:4]}.{rd[4:6]}.{rd[6:]}"
-            
+
             price_details = []
-            if data.get('restricted', 0):
-                restricted_price_line = f"🎯 조건부: {data['restricted']:,}원"
-                if data.get('restricted_info'):
-                    restricted_price_line += f"\n   └ {data['restricted_info']}"
-                price_details.append(restricted_price_line)
+            if notification_price_type in ["RESTRICTED_ONLY", "BOTH"]:
+                if data.get('restricted', 0):
+                    restricted_price_line = f"🎯 조건부: {data['restricted']:,}원"
+                    if data.get('restricted_info'):
+                        restricted_price_line += f"\\n   └ {data['restricted_info']}"
+                    price_details.append(restricted_price_line)
+                elif notification_price_type == "RESTRICTED_ONLY":
+                    price_details.append("🎯 조건부: 조회된 가격 없음")
+
+
+            if notification_price_type in ["OVERALL_ONLY", "BOTH"]:
+                if data.get('overall', 0):
+                    overall_price_line = f"📌 전체: {data['overall']:,}원"
+                    if data.get('overall_info'):
+                        overall_price_line += f"\\n   └ {data['overall_info']}"
+                    price_details.append(overall_price_line)
+                elif notification_price_type == "OVERALL_ONLY":
+                    price_details.append("📌 전체: 조회된 가격 없음")
             
-            if data.get('overall', 0):
-                overall_price_line = f"📌 전체: {data['overall']:,}원"
-                if data.get('overall_info'):
-                    overall_price_line += f"\n   └ {data['overall_info']}"
-                price_details.append(overall_price_line)
-            
-            price_info_display = "\n".join(price_details) if price_details else "조회된 가격 없음"
+            price_info_display = "\\n".join(price_details) if price_details else "표시할 가격 정보가 없거나, 알림 설정에 따라 생략되었습니다."
 
             msg_lines.extend([
                 "",
