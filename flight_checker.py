@@ -488,6 +488,8 @@ async def monitor_setting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "start_time": start_time,
             "restricted": restricted or 0,
             "overall": overall or 0,
+            "restricted_info": r_info or "",
+            "overall_info": o_info or "",
             "last_fetch": config_manager.format_datetime(datetime.now()),
             "time_setting_outbound": format_time_range(user_config, 'outbound'),
             "time_setting_inbound": format_time_range(user_config, 'inbound')
@@ -590,12 +592,14 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         state = await load_json_data_async(hist_path)
+        
     except json.JSONDecodeError:
         logger.error(f"monitor_job: JSON 디코딩 오류 {hist_path.name}. 작업 중단 및 파일 삭제 시도.")
         try: hist_path.unlink()
         except OSError as e: logger.error(f"손상된 히스토리 파일 삭제 실패 {hist_path.name}: {e}")
         context.job.schedule_removal()
         return
+    
     except FileNotFoundError:
         logger.warning(f"monitor_job: 히스토리 파일 (lock 내부) 없음, 작업 중단: {hist_path.name}")
         context.job.schedule_removal()
@@ -660,6 +664,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True
                 )
                 logger.info(f"가격 하락 알림 전송 완료 for {hist_path.name}")
+
             except Exception as send_error:
                 logger.error(f"가격 하락 알림 전송 실패 ({hist_path.name}): {send_error}")
 
@@ -686,21 +691,43 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as send_error:
                 logger.error(f"항공권 없음 알림 전송 실패 ({hist_path.name}): {send_error}")
+
     except NoFlightDataException:
         logger.warning(f"monitor_job: 항공권 정보 없음 (아마도 경로 문제) - {hist_path.name}")
+
     except Exception as ex:
         logger.error(f"monitor_job 실행 중 오류 발생 ({hist_path.name}): {ex}", exc_info=True)
 
     current_user_config = await get_user_config_async(user_id)
+
+    new_restricted_price = restricted if restricted is not None else old_restr
+    new_overall_price = overall if overall is not None else old_overall
+    
+    # 가격이 존재하고, 해당 정보(r_info, o_info)가 있을 때만 저장, 아니면 빈 문자열
+    new_restricted_info = r_info if new_restricted_price and r_info else ""
+    new_overall_info = o_info if new_overall_price and o_info else ""
+
+    # 만약 NoMatchingFlightsException 등으로 인해 restricted/overall이 None이 되어
+    # new_restricted_price/new_overall_price가 0이 된 경우, info도 비워야 함.
+    # fetch_prices에서 반환된 r_info, o_info를 사용하되, 해당 가격이 0이거나 없으면 info도 비움.
+    if not new_restricted_price:
+        new_restricted_info = ""
+    if not new_overall_price:
+        new_overall_info = ""
+
     new_state_data = {
         "start_time": state.get("start_time"),
-        "restricted": restricted if restricted is not None else old_restr,
-        "overall": overall if overall is not None else old_overall,
+        "restricted": new_restricted_price,
+        "overall": new_overall_price,
+        "restricted_info": new_restricted_info,
+        "overall_info": new_overall_info,
         "last_fetch": config_manager.format_datetime(datetime.now()),
         "time_setting_outbound": format_time_range(current_user_config, 'outbound'),
         "time_setting_inbound": format_time_range(current_user_config, 'inbound')
     }
+
     logger.debug(f"[{hist_path.name}] 상태 저장 시도: {new_state_data}")
+
     try:
         await save_json_data_async(hist_path, new_state_data)
         logger.info(f"[{hist_path.name}] 상태 저장 및 last_fetch 업데이트 성공. 새 last_fetch: {new_state_data.get('last_fetch')}")
@@ -749,18 +776,26 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             dd_fmt = f"{dd[2:4]}.{dd[4:6]}.{dd[6:]}"
             rd_fmt = f"{rd[2:4]}.{rd[4:6]}.{rd[6:]}"
             
-            prices = []
-            if data['restricted']:
-                prices.append(f"조건부: {data['restricted']:,}원")
-            if data['overall']:
-                prices.append(f"전체: {data['overall']:,}원")
-            price_info = " / ".join(prices) if prices else "조회된 가격 없음"
+            price_details = []
+            if data.get('restricted', 0):
+                restricted_price_line = f"🎯 조건부: {data['restricted']:,}원"
+                if data.get('restricted_info'):
+                    restricted_price_line += f"\\n   └ {data['restricted_info']}"
+                price_details.append(restricted_price_line)
             
+            if data.get('overall', 0):
+                overall_price_line = f"📌 전체: {data['overall']:,}원"
+                if data.get('overall_info'):
+                    overall_price_line += f"\\n   └ {data['overall_info']}"
+                price_details.append(overall_price_line)
+            
+            price_info_display = "\\n".join(price_details) if price_details else "조회된 가격 없음"
+
             msg_lines.extend([
                 "",
                 f"*{idx}. {dep_city}({dep}) ↔ {arr_city}({arr})*",
                 f"📅 {dd_fmt} → {rd_fmt}",
-                f"💰 {price_info}",
+                f"💰 최저가 현황:\\n{price_info_display}",
                 f"⏱️ {elapsed}일째 진행 중",
                 f"🔄 마지막 조회: {data['last_fetch']}",
                 f"[🔗 네이버 항공권](https://flight.naver.com/flights/international/{dep}-{arr}-{dd}/{arr}-{dep}-{rd}?adult=1&fareType=Y)"
